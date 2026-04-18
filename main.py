@@ -29,6 +29,7 @@ import db
 import display
 import ocr
 from config import (
+    ANSWER_DISPLAY_S,
     BOOK_SWITCH_HOLD_S,
     BOOK_SWITCH_SIMILARITY,
     BUTTON_PIN,
@@ -871,6 +872,10 @@ def _handle_ptt_answer(wav_path: Path) -> None:
             result["oled_answer"] or result["answer"],
             refused=result["refused_as_spoiler"],
         )
+        # Hold the answer on the OLED so the user can actually read it.
+        # STATE.busy stays True during this sleep, blocking the idle loop
+        # from overwriting the screen.
+        time.sleep(ANSWER_DISPLAY_S)
     finally:
         with STATE.lock:
             STATE.busy = False

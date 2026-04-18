@@ -85,12 +85,21 @@ RESUME_SKIP_HOLD_S = 2.0
 IDLE_TIMEOUT = 20.0
 IDLE_CARD_SECONDS = 8.0
 QR_EVERY_SECONDS = 60.0
+# How long the OLED answer stays on screen after a PTT question is
+# answered. During this window STATE.busy remains True so the idle
+# loop cannot overwrite it.
+ANSWER_DISPLAY_S = 8.0
 
 QUESTION_RECORD_SECONDS = 5
+# The INMP441 is a mono I2S mic. plughw:0,0 (with the ALSA plug layer)
+# handles the format conversion from the hardware's native S32_LE/2ch to
+# whatever we request here. 16kHz mono S16_LE is the standard speech
+# format — Gemini transcribes it reliably and file sizes stay small
+# (~32 KB/s vs ~384 KB/s with 48k/2ch/S32).
 ARECORD_DEVICE = "plughw:0,0"
-ARECORD_RATE = 48000
-ARECORD_CHANNELS = 2
-ARECORD_FORMAT = "S32_LE"
+ARECORD_RATE = 16000
+ARECORD_CHANNELS = 1
+ARECORD_FORMAT = "S16_LE"
 
 MODEL_NAME = "gemini-2.5-flash"
 
