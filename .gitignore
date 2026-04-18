@@ -1,0 +1,36 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# runtime / local
+lumos.db
+lumos.db-journal
+lumos.db-wal
+lumos.db-shm
+/tmp/lumos/
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# frontend build tooling (we ship dist/ in the repo for Pi deployment)
+app/frontend/node_modules/
+node_modules/
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# logs
+*.log
+
+# macOS, etc
+Thumbs.db
