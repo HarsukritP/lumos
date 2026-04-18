@@ -59,6 +59,15 @@ class State:
         self.last_capture_ok: bool = False
         self.last_capture_reason: str = ""
 
+        # strict book-scan state
+        # last N identify attempts as (title_key, author_key, confidence, ts)
+        self.identify_trail: list[tuple[str, str, float, float]] = []
+        self.current_title_key: str | None = None
+        self.current_author_key: str | None = None
+        self.oled_title: str = ""   # short title for the OLED (populated at identify)
+        # book-switch tracking
+        self.dissimilar_since: float | None = None
+
     def touch(self) -> None:
         self.last_activity = time.time()
 
@@ -86,9 +95,14 @@ class State:
         }
 
     def to_debug(self) -> dict:
+        trail = [
+            {"title_key": t, "author_key": a, "conf": c, "age_s": time.time() - ts}
+            for (t, a, c, ts) in self.identify_trail[-5:]
+        ]
         return {
             "phase": self.phase,
             "book_title": self.book_title,
+            "oled_title": self.oled_title,
             "current_page": self.current_page,
             "busy": self.busy,
             "last_capture_at": self.last_capture_at,
@@ -98,7 +112,26 @@ class State:
             "last_capture_reason": self.last_capture_reason,
             "last_commit_at": self.last_commit_at,
             "uptime_s": time.time() - self.started_at,
+            "identify_trail": trail,
+            "dissimilar_since": self.dissimilar_since,
         }
+
+    def reset_book(self) -> None:
+        """Drop the current book context so the watch loop starts hunting again."""
+        with self.lock:
+            self.book_id = None
+            self.book_title = "Unknown"
+            self.book_author = "Unknown"
+            self.current_page = 0
+            self.last_committed = None
+            self.pending_frame = None
+            self.pending_path = None
+            self.pending_since = None
+            self.identify_trail.clear()
+            self.current_title_key = None
+            self.current_author_key = None
+            self.oled_title = ""
+            self.dissimilar_since = None
 
 
 STATE = State()

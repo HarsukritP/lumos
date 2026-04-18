@@ -46,6 +46,19 @@ PAGE_BRIGHTNESS_MAX = 235.0   # reject blown-out white frames
 # book row or summarize — we're probably looking at nothing/hands/noise.
 IDENTIFY_MIN_CONFIDENCE = 0.35
 
+# Strict book-scan flow. We require N consecutive identifies to agree on a
+# normalized (title, author) before we commit a book. This stops a single
+# blurry frame ("is that Dune?") from creating a book row.
+IDENTIFY_CONFIRMATIONS = 2            # how many agreeing identifies needed
+IDENTIFY_MIN_COVER_CONFIDENCE = 0.55  # higher bar for cover-only IDs
+
+# Book-switch detection. While reading, if a new frame's similarity to the
+# last committed frame drops below this for BOOK_SWITCH_HOLD_S seconds AND a
+# re-identify returns a different book, we jump back to HUNTING. Deliberately
+# lower than SIMILARITY_THRESHOLD (0.75) so normal page turns don't trigger.
+BOOK_SWITCH_SIMILARITY = 0.35
+BOOK_SWITCH_HOLD_S = 4.0
+
 IDLE_TIMEOUT = 20.0
 IDLE_CARD_SECONDS = 8.0
 QR_EVERY_SECONDS = 60.0

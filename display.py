@@ -246,26 +246,85 @@ def show_answer(answer: str, refused: bool = False) -> None:
         _flush(img)
 
 
-def show_qr(url: str, caption: str = "scan me") -> None:
-    """Render a QR pointing at `url`, centered on the left half; caption on right."""
+def _render_qr(url: str, target_px: int) -> Image.Image:
+    """Render a QR for `url` at roughly `target_px` on a side, using an
+    integer box_size (pixels per module) so modules land on pixel boundaries.
+
+    SSD1306 is 1-bit and tiny; a non-integer scale smears modules and makes
+    the code unscannable. We render the QR at its native size (no resize)
+    and return a PIL "1"-mode image with white modules on a black quiet zone
+    (matches OLED lit-pixels = module)."""
     import qrcode
 
-    qr = qrcode.QRCode(border=1, box_size=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
+    # Error correction L keeps the code as small as possible; phones handle
+    # low-correction QRs fine when modules are crisp. Border of 2 gives the
+    # required quiet zone without wasting precious pixels.
+    border = 2
+    # Pick the largest box_size that still fits in target_px. Start with a
+    # throw-away version just to discover module_count.
+    probe = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=1,
+        border=border,
+    )
+    probe.add_data(url)
+    probe.make(fit=True)
+    modules = probe.modules_count  # e.g. 25 for version 2
+    total_modules = modules + 2 * border
+    box_size = max(1, target_px // total_modules)
+
+    qr = qrcode.QRCode(
+        version=probe.version,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=box_size,
+        border=border,
+    )
     qr.add_data(url)
     qr.make(fit=True)
-    qr_img = qr.make_image(fill_color=255, back_color=0).convert("1")
-    # Scale QR up to fit 60x60 square on the left
-    target = 60
-    qr_img = qr_img.resize((target, target), Image.NEAREST)
+    # Render in the classic orientation: black modules on a white quiet zone.
+    # On the OLED this means the QR region lights up (white pixels = on) with
+    # dark modules cut out — the pattern every phone scanner expects. Inverted
+    # QRs (white modules on dark) work on iOS and modern Android but break on
+    # a surprising number of third-party scanners, so we don't risk it.
+    return qr.make_image(fill_color="black", back_color="white").convert("1")
+
+
+def show_qr(url: str, caption: str | None = None) -> None:
+    """Welcome/connect screen: pixel-perfect QR on the left, 'scan to open
+    Lumos' block on the right. The `caption` arg is accepted for backwards
+    compatibility but ignored; the layout is fixed."""
+    del caption  # layout is fixed; no dynamic caption
+
+    qr_img = _render_qr(url, target_px=OLED_HEIGHT)  # ~58px for our URLs
+    qw, qh = qr_img.size
 
     img = _blank()
-    img.paste(qr_img, (2, (OLED_HEIGHT - target) // 2))
+    # Left: QR, vertically centered with a 1-px left margin.
+    qx = 1
+    qy = max(0, (OLED_HEIGHT - qh) // 2)
+    img.paste(qr_img, (qx, qy))
+
     draw = ImageDraw.Draw(img)
-    x = target + 6
-    draw.text((x, 6), caption, font=FONT_MD, fill=255)
-    draw.text((x, 22), "open", font=FONT_SM, fill=255)
-    draw.text((x, 34), "Lumos", font=FONT_MD, fill=255)
-    draw.text((x, 50), "library", font=FONT_SM, fill=255)
+
+    # Right column: from just past the QR to the right edge.
+    col_x = qx + qw + 5
+    col_w = OLED_WIDTH - col_x - 1
+
+    def _centered(text: str, y: int, font) -> None:
+        tw = _text_width(draw, text, font)
+        x = col_x + max(0, (col_w - tw) // 2)
+        draw.text((x, y), text, font=font, fill=255)
+
+    # Three-line typographic block (QR already carries the URL, so no
+    # redundant host footer that would just truncate on a 128px display):
+    #   SCAN     (FONT_LG, 16px tall)
+    #   to open  (FONT_SM, 10px)
+    #   Lumos    (FONT_LG, 16px tall)
+    _centered("SCAN",    2, FONT_LG)
+    _centered("to open", 24, FONT_SM)
+    _centered("Lumos",  40, FONT_LG)
+
     with _lock:
         _flush(img)
 

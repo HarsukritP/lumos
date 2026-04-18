@@ -1,19 +1,29 @@
 """SQLite persistence for Lumos.
 
-One connection per thread is safe because Python's `sqlite3` ships with
-`check_same_thread=False` + explicit locking when we pass `isolation_level=None`
-and serialize writes through the single write lock SQLite already provides.
+One connection, shared across threads with `check_same_thread=False`, all
+writes serialized through the single module-level `_lock`. WAL mode lets the
+Flask read-threads run concurrently with the orchestrator's writes.
+
+Dedup rule: books are keyed by `(title_key, author_key)` — the lowercased,
+whitespace-normalized title and author — NOT by image phash. Cover photos
+jitter enough that phash-based keys create ghost "books" for the same
+physical book. Phash is still stored as `cover_phash` for diagnostics and
+as a weak same-cover hint, just not as the identity.
 """
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any, Iterable
 
 from config import DB_PATH
 
+log = logging.getLogger("lumos.db")
 
 _lock = threading.Lock()
 
@@ -36,18 +46,28 @@ def conn() -> sqlite3.Connection:
     return _conn
 
 
+SCHEMA_VERSION = 2
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS books (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    phash TEXT UNIQUE NOT NULL,
-    title TEXT NOT NULL DEFAULT 'Unknown',
-    author TEXT NOT NULL DEFAULT 'Unknown',
+    title_key TEXT NOT NULL,
+    author_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    author TEXT NOT NULL,
     is_textbook INTEGER NOT NULL DEFAULT 0,
     current_page INTEGER NOT NULL DEFAULT 0,
     total_pages INTEGER,
+    cover_phash TEXT,
     cover_path TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    UNIQUE(title_key, author_key)
 );
 
 CREATE TABLE IF NOT EXISTS pages (
@@ -55,6 +75,7 @@ CREATE TABLE IF NOT EXISTS pages (
     book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
     page_number INTEGER NOT NULL,
     summary TEXT NOT NULL,
+    oled_summary TEXT NOT NULL DEFAULT '',
     characters_json TEXT NOT NULL DEFAULT '[]',
     vocabulary_json TEXT NOT NULL DEFAULT '[]',
     concepts_json TEXT NOT NULL DEFAULT '[]',
@@ -69,6 +90,7 @@ CREATE TABLE IF NOT EXISTS questions (
     page_number INTEGER,
     question TEXT NOT NULL,
     answer TEXT NOT NULL,
+    oled_answer TEXT NOT NULL DEFAULT '',
     is_spoiler_refusal INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
@@ -77,46 +99,192 @@ CREATE INDEX IF NOT EXISTS idx_questions_book ON questions(book_id, created_at);
 """
 
 
+def _current_schema_version() -> int:
+    c = conn()
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if not row:
+        return 0
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        return 0
+
+
 def init_db() -> None:
+    """Create the schema; if an older schema is on disk, drop and recreate.
+
+    We're pre-launch; no migration data is worth preserving. If a user has
+    bound data they care about, they would have asked for a migration path."""
     c = conn()
     with _lock:
+        existing = _current_schema_version()
+        if existing and existing < SCHEMA_VERSION:
+            log.warning(
+                "db schema v%d < v%d; wiping and recreating",
+                existing, SCHEMA_VERSION,
+            )
+            _drop_all_tables(c)
+        elif existing == 0:
+            # Could be either a blank DB or a v1 schema with no meta row.
+            # If books table already exists without title_key, it's v1 → drop.
+            cols = [r["name"] for r in c.execute("PRAGMA table_info(books)")]
+            if cols and "title_key" not in cols:
+                log.warning("legacy books schema detected; wiping")
+                _drop_all_tables(c)
         c.executescript(SCHEMA)
+        c.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
         c.commit()
+
+
+def _drop_all_tables(c: sqlite3.Connection) -> None:
+    # Order matters for FK constraints, but since we're dropping everything
+    # in one transaction and PRAGMA foreign_keys can be momentarily turned
+    # off, just execute unconditionally.
+    c.execute("PRAGMA foreign_keys=OFF")
+    for name in ("questions", "pages", "books", "meta"):
+        c.execute(f"DROP TABLE IF EXISTS {name}")
+    c.execute("PRAGMA foreign_keys=ON")
+
+
+def reset() -> dict:
+    """Wipe all user-visible rows (books/pages/questions). Schema stays.
+    Returns before/after row counts so callers can show a summary."""
+    before = stats()
+    c = conn()
+    with _lock:
+        c.execute("PRAGMA foreign_keys=OFF")
+        c.execute("DELETE FROM questions")
+        c.execute("DELETE FROM pages")
+        c.execute("DELETE FROM books")
+        # Reset AUTOINCREMENT counters so IDs restart at 1 after a reset.
+        try:
+            c.execute("DELETE FROM sqlite_sequence")
+        except sqlite3.OperationalError:
+            pass
+        c.execute("PRAGMA foreign_keys=ON")
+        c.commit()
+    after = stats()
+    log.info("db reset: %s -> %s", before["counts"], after["counts"])
+    return {"before": before, "after": after}
+
+
+def stats() -> dict:
+    """Row counts + on-disk footprint. Safe to call from any thread."""
+    c = conn()
+    counts: dict[str, int] = {}
+    with _lock:
+        for table in ("books", "pages", "questions"):
+            try:
+                n = c.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            except sqlite3.OperationalError:
+                n = 0
+            counts[table] = int(n)
+    size = 0
+    paths = []
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(DB_PATH) + suffix)
+        if p.exists():
+            size += p.stat().st_size
+            paths.append(str(p))
+    return {
+        "db_path": str(DB_PATH),
+        "schema_version": SCHEMA_VERSION,
+        "size_bytes": size,
+        "files": paths,
+        "counts": counts,
+    }
 
 
 def _now() -> float:
     return time.time()
 
 
+# ----- identity normalization ---------------------------------------------
+
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_identity(title: str, author: str) -> tuple[str, str]:
+    """Canonical form used for dedup. Lowercased, punctuation-stripped, and
+    whitespace-collapsed. Must be stable across Gemini responses for the
+    same physical book.
+
+    Examples:
+      ("The Brothers Karamazov", "Fyodor Dostoevsky")
+        -> ("the brothers karamazov", "fyodor dostoevsky")
+      ("  The  Brothers  Karamazov!", "Dostoevsky, Fyodor")
+        -> ("the brothers karamazov", "dostoevsky fyodor")
+    """
+    def norm(s: str) -> str:
+        s = (s or "").strip().lower()
+        # strip most punctuation; keep letters, digits, spaces, hyphen
+        s = re.sub(r"[^\w\-\s]", " ", s, flags=re.UNICODE)
+        s = _WS_RE.sub(" ", s).strip()
+        return s
+    return norm(title), norm(author)
+
+
 # ----- books ---------------------------------------------------------------
 
-def get_or_create_book(phash: str) -> sqlite3.Row:
+def find_book_by_identity(title: str, author: str) -> dict | None:
+    tk, ak = normalize_identity(title, author)
+    if not tk:
+        return None
     c = conn()
     with _lock:
-        row = c.execute("SELECT * FROM books WHERE phash = ?", (phash,)).fetchone()
-        if row is not None:
-            return row
-        now = _now()
-        cur = c.execute(
-            "INSERT INTO books (phash, created_at, updated_at) VALUES (?, ?, ?)",
-            (phash, now, now),
-        )
-        c.commit()
-        return c.execute(
-            "SELECT * FROM books WHERE id = ?", (cur.lastrowid,)
+        row = c.execute(
+            "SELECT * FROM books WHERE title_key=? AND author_key=?", (tk, ak)
         ).fetchone()
+    return dict(row) if row else None
 
 
-def update_book_identity(
-    book_id: int, title: str, author: str, is_textbook: bool
-) -> None:
+def find_or_create_book_by_identity(
+    title: str,
+    author: str,
+    is_textbook: bool,
+    cover_phash: str | None = None,
+) -> dict:
+    """Idempotent: same (title, author) returns the same row across calls.
+    Creates it (or updates identity fields) on first sight."""
+    tk, ak = normalize_identity(title, author)
+    if not tk:
+        raise ValueError("cannot create book with empty title")
     c = conn()
+    now = _now()
     with _lock:
-        c.execute(
-            "UPDATE books SET title=?, author=?, is_textbook=?, updated_at=? WHERE id=?",
-            (title, author, 1 if is_textbook else 0, _now(), book_id),
+        row = c.execute(
+            "SELECT * FROM books WHERE title_key=? AND author_key=?", (tk, ak)
+        ).fetchone()
+        if row is not None:
+            # Refresh descriptive fields if they improved.
+            c.execute(
+                "UPDATE books SET title=?, author=?, is_textbook=?, "
+                "cover_phash=COALESCE(?, cover_phash), updated_at=? WHERE id=?",
+                (title, author, 1 if is_textbook else 0,
+                 cover_phash, now, row["id"]),
+            )
+            c.commit()
+            row = c.execute(
+                "SELECT * FROM books WHERE id=?", (row["id"],)
+            ).fetchone()
+            return dict(row)
+        cur = c.execute(
+            "INSERT INTO books (title_key, author_key, title, author, "
+            "is_textbook, cover_phash, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (tk, ak, title, author, 1 if is_textbook else 0, cover_phash, now, now),
         )
         c.commit()
+        row = c.execute(
+            "SELECT * FROM books WHERE id=?", (cur.lastrowid,)
+        ).fetchone()
+    return dict(row)
 
 
 def set_current_page(book_id: int, page_number: int) -> None:
@@ -157,6 +325,7 @@ def add_page(
     book_id: int,
     page_number: int,
     summary: str,
+    oled_summary: str,
     characters: Iterable[Any],
     vocabulary: Iterable[Any],
     concepts: Iterable[Any],
@@ -166,14 +335,15 @@ def add_page(
         cur = c.execute(
             """
             INSERT INTO pages
-              (book_id, page_number, summary, characters_json, vocabulary_json,
-               concepts_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+              (book_id, page_number, summary, oled_summary, characters_json,
+               vocabulary_json, concepts_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 book_id,
                 page_number,
                 summary,
+                oled_summary,
                 json.dumps(list(characters)),
                 json.dumps(list(vocabulary)),
                 json.dumps(list(concepts)),
@@ -189,8 +359,8 @@ def recent_summaries(book_id: int, n: int = 5) -> list[dict]:
     with _lock:
         rows = c.execute(
             """
-            SELECT page_number, summary, characters_json, vocabulary_json,
-                   concepts_json, created_at
+            SELECT page_number, summary, oled_summary, characters_json,
+                   vocabulary_json, concepts_json, created_at
             FROM pages
             WHERE book_id=?
             ORDER BY page_number DESC
@@ -204,6 +374,7 @@ def recent_summaries(book_id: int, n: int = 5) -> list[dict]:
             {
                 "page_number": r["page_number"],
                 "summary": r["summary"],
+                "oled_summary": r["oled_summary"],
                 "characters": json.loads(r["characters_json"]),
                 "vocabulary": json.loads(r["vocabulary_json"]),
                 "concepts": json.loads(r["concepts_json"]),
@@ -239,6 +410,7 @@ def add_question(
     page_number: int | None,
     question: str,
     answer: str,
+    oled_answer: str,
     is_spoiler_refusal: bool,
 ) -> int:
     c = conn()
@@ -246,14 +418,16 @@ def add_question(
         cur = c.execute(
             """
             INSERT INTO questions
-              (book_id, page_number, question, answer, is_spoiler_refusal, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+              (book_id, page_number, question, answer, oled_answer,
+               is_spoiler_refusal, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 book_id,
                 page_number,
                 question,
                 answer,
+                oled_answer,
                 1 if is_spoiler_refusal else 0,
                 _now(),
             ),
@@ -303,6 +477,7 @@ def all_vocab() -> list[dict]:
                     {
                         "word": v.get("word", ""),
                         "definition": v.get("definition", ""),
+                        "oled_definition": v.get("oled_definition", ""),
                         "page_number": r["page_number"],
                         "book_id": r["book_id"],
                         "book_title": r["book_title"],
@@ -313,29 +488,67 @@ def all_vocab() -> list[dict]:
     return out
 
 
+# ----- inspector (raw table dump for admin view) ---------------------------
+
+INSPECTOR_TABLES = ("meta", "books", "pages", "questions")
+
+
+def dump_tables(limit_per_table: int = 200) -> dict:
+    """Raw JSON-able dump of each user-visible table for the admin view.
+    Truncates JSON blobs so a bloated row doesn't break the UI."""
+    c = conn()
+    out: dict[str, Any] = {}
+    with _lock:
+        for t in INSPECTOR_TABLES:
+            try:
+                cols = [r["name"] for r in c.execute(f"PRAGMA table_info({t})")]
+                rows = c.execute(
+                    f"SELECT * FROM {t} LIMIT ?", (limit_per_table,)
+                ).fetchall()
+                out[t] = {
+                    "columns": cols,
+                    "rows": [dict(r) for r in rows],
+                    "count": c.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"],
+                }
+            except sqlite3.OperationalError as e:
+                out[t] = {"error": str(e)}
+    return out
+
+
 # ----- smoke test ----------------------------------------------------------
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     init_db()
-    b = get_or_create_book("smoketest_phash_abc123")
-    print("book:", dict(b))
-    update_book_identity(b["id"], "Smoke Book", "Test Author", False)
-    set_current_page(b["id"], 12)
-    add_page(
-        b["id"],
-        12,
-        "On this page the detective investigates a suspicious manor.",
-        [{"name": "Holmes", "role": "detective"}],
-        [{"word": "perspicacious", "definition": "shrewdly discerning"}],
-        ["deduction"],
+    print("stats:", stats())
+    b = find_or_create_book_by_identity(
+        "The Brothers Karamazov", "Fyodor Dostoevsky", is_textbook=False,
+        cover_phash="smoke_abc123",
     )
-    add_question(b["id"], 12, "Who is Holmes?", "A detective.", False)
-    print("books:", all_books())
-    print("summaries:", recent_summaries(b["id"]))
+    print("book:", b)
+    # Dedup is case-insensitive + punctuation/whitespace tolerant, but it
+    # does NOT reorder tokens — ("Last, First" vs "First Last") counts as
+    # two different authors. Gemini returns a consistent form in practice.
+    b2 = find_or_create_book_by_identity(
+        "  the  Brothers Karamazov!", "Fyodor DOSTOEVSKY", is_textbook=False,
+    )
+    assert b2["id"] == b["id"], f"dedup broken: {b['id']} vs {b2['id']}"
+    print("dedup ok (case + punctuation + whitespace tolerant)")
+    pid = add_page(
+        b["id"], 312,
+        "Ivan's anxiety sharpens as the evening cools over the courtyard.",
+        "Ivan tense in courtyard.",
+        [{"name": "Ivan", "role": "brother"}],
+        [{"word": "perspicacious", "definition": "shrewdly discerning", "oled_definition": "shrewd"}],
+        [],
+    )
+    add_question(b["id"], 312, "Who is Ivan?", "Ivan is the middle Karamazov brother, a rationalist.",
+                 "Ivan: middle brother, rationalist.", False)
+    print("recent:", recent_summaries(b["id"]))
     print("vocab:", all_vocab())
-    print("questions:", book_questions(b["id"]))
-    # Clean up so this row doesn't pollute the demo DB
+    # Clean up so this row doesn't pollute a real DB
     with _lock:
-        conn().execute("DELETE FROM books WHERE phash='smoketest_phash_abc123'")
+        conn().execute("DELETE FROM books WHERE id=?", (b["id"],))
         conn().commit()
+    print("stats after cleanup:", stats()["counts"])
     print("OK")

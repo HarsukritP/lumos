@@ -28,10 +28,14 @@ import camera
 import db
 import display
 from config import (
+    BOOK_SWITCH_HOLD_S,
+    BOOK_SWITCH_SIMILARITY,
     BUTTON_PIN,
     CAPTURE_INTERVAL,
     FRAME_PATH,
+    IDENTIFY_CONFIRMATIONS,
     IDENTIFY_MIN_CONFIDENCE,
+    IDENTIFY_MIN_COVER_CONFIDENCE,
     IDLE_CARD_SECONDS,
     IDLE_TIMEOUT,
     LIBRARY_URL,
@@ -101,54 +105,116 @@ def render_idle_card(card: dict) -> None:
         display.show_ready(STATE.book_title if STATE.book_id else None, STATE.current_page)
 
 
-# ----- capture + commit ----------------------------------------------------
+# ----- identify + commit ---------------------------------------------------
 
-def _commit_page(img: Image.Image, img_path: Path) -> None:
-    """Called when pending_frame has been stable long enough.
+def _record_identify_attempt(title: str, author: str, conf: float) -> None:
+    """Append to the rolling identify trail, keep only the last 8 entries."""
+    tk, ak = db.normalize_identity(title, author)
+    with STATE.lock:
+        STATE.identify_trail.append((tk, ak, conf, time.time()))
+        del STATE.identify_trail[:-8]
 
-    If there's no current book, run identify_book first. Then always run
-    summarize_page to persist what's on this page.
-    """
+
+def _agreeing_identifies(window_s: float = 30.0) -> tuple[str, str, int] | None:
+    """Look at recent identify attempts and, if the last N (>= IDENTIFY_CONFIRMATIONS)
+    all agree on the same non-empty (title_key, author_key), return that
+    key plus the agreement count. Otherwise None."""
+    now = time.time()
+    trail = [e for e in STATE.identify_trail if now - e[3] <= window_s and e[0]]
+    if len(trail) < IDENTIFY_CONFIRMATIONS:
+        return None
+    last = trail[-IDENTIFY_CONFIRMATIONS:]
+    tk, ak, _, _ = last[0]
+    if not tk or tk == "unknown":
+        return None
+    for e in last[1:]:
+        if e[0] != tk or e[1] != ak:
+            return None
+    return tk, ak, len(last)
+
+
+def _try_identify_book(img: Image.Image, img_path: Path) -> bool:
+    """Run identify_book on this frame; commit to a book only after the last
+    IDENTIFY_CONFIRMATIONS attempts agree. Returns True iff a book was
+    committed in this call (caller can then fall through to page-reading)."""
+    display.show_status("Lumos", ["identifying", "this book..."])
     try:
-        if STATE.book_id is None:
-            display.show_status("Lumos", ["identifying", "this book..."])
-            ident = ai.identify_book(img_path)
-            title = ident["title"]
-            author = ident["author"]
-            is_textbook = ident["is_textbook"]
-            conf = ident["confidence"]
-            log.info(
-                "identified: %r by %r (tb=%s, conf=%.2f)",
-                title, author, is_textbook, conf,
-            )
-            if (
-                conf < IDENTIFY_MIN_CONFIDENCE
-                or (title.strip().lower() == "unknown" and author.strip().lower() == "unknown")
-            ):
-                log.info("identification rejected (conf<%.2f or unknown); not committing",
-                         IDENTIFY_MIN_CONFIDENCE)
-                # Drop last_committed so the next real page still gets a chance.
-                with STATE.lock:
-                    STATE.last_committed = None
-                # Idle loop (phase=hunting) will restore the "looking for a
-                # book..." card; we don't need to touch the display here.
-                return
-            phash = camera.phash(img)
-            row = db.get_or_create_book(phash)
-            db.update_book_identity(row["id"], title, author, is_textbook)
-            with STATE.lock:
-                STATE.book_id = row["id"]
-                STATE.book_title = title
-                STATE.book_author = author
-            STATE.set_phase(PHASE_READING, reason=f"identified {title!r}")
+        ident = ai.identify_book(img_path)
+    except ai.AIError as e:
+        log.warning("identify unavailable: %r", e)
+        return False
 
+    title = ident["title"]
+    author = ident["author"]
+    is_textbook = ident["is_textbook"]
+    conf = ident["confidence"]
+    cover = ident.get("cover_visible", False)
+    oled_title = ident.get("oled_title", title)
+    log.info(
+        "identify: %r by %r tb=%s conf=%.2f cover=%s",
+        title, author, is_textbook, conf, cover,
+    )
+
+    # Single-frame rejection gates (don't even add to the trail if we're
+    # clearly looking at nothing). Cover frames are held to a higher bar.
+    min_conf = IDENTIFY_MIN_COVER_CONFIDENCE if cover else IDENTIFY_MIN_CONFIDENCE
+    if (
+        conf < min_conf
+        or (title.strip().lower() == "unknown" and author.strip().lower() == "unknown")
+    ):
+        log.info("identify rejected: conf %.2f < %.2f or unknown", conf, min_conf)
+        with STATE.lock:
+            STATE.last_committed = None
+        return False
+
+    _record_identify_attempt(title, author, conf)
+    agree = _agreeing_identifies()
+    if agree is None:
+        n = sum(1 for e in STATE.identify_trail
+                if db.normalize_identity(title, author)[0] == e[0])
+        log.info("identify held: need %d agreeing, have %d of %r",
+                 IDENTIFY_CONFIRMATIONS, n, title)
+        # Reflect progress on the OLED so the demo feels alive.
+        display.show_status(
+            "Lumos",
+            [f"saw \"{_clip(oled_title, 10)}\"", f"{n}/{IDENTIFY_CONFIRMATIONS} confirmed"],
+        )
+        return False
+
+    tk, ak, count = agree
+    row = db.find_or_create_book_by_identity(
+        title, author, is_textbook, cover_phash=camera.phash(img),
+    )
+    with STATE.lock:
+        STATE.book_id = row["id"]
+        STATE.book_title = row["title"]
+        STATE.book_author = row["author"]
+        STATE.current_page = int(row.get("current_page") or 0)
+        STATE.current_title_key = tk
+        STATE.current_author_key = ak
+        STATE.oled_title = oled_title
+    STATE.set_phase(PHASE_READING, reason=f"identified {row['title']!r} ({count}/{IDENTIFY_CONFIRMATIONS})")
+    return True
+
+
+def _clip(s: str, n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 1] + "\u2026"
+
+
+def _commit_page_read(img: Image.Image, img_path: Path) -> None:
+    """Summarize the current page and persist it. Assumes a book is already
+    identified and we're in PHASE_READING."""
+    try:
         display.show_status("Lumos", ["reading", "the page..."])
         summary = ai.summarize_page(img_path, STATE.book_title, STATE.current_page)
         page_number = summary["page_number"]
+        oled_summary = summary["oled_summary"]
         db.add_page(
             STATE.book_id,
             page_number,
             summary["summary"],
+            oled_summary,
             summary["characters"],
             summary["vocabulary"],
             summary["concepts"],
@@ -160,13 +226,19 @@ def _commit_page(img: Image.Image, img_path: Path) -> None:
             STATE.last_commit_at = time.time()
 
         for v in summary["vocabulary"]:
-            if isinstance(v, dict) and v.get("word") and v.get("definition"):
-                queue_vocab_card(v["word"], v["definition"])
+            if isinstance(v, dict) and v.get("word"):
+                # Prefer the OLED-short form; fall back to the long one.
+                definition = v.get("oled_definition") or v.get("definition") or ""
+                if definition:
+                    queue_vocab_card(v["word"], definition)
         for c in summary["characters"]:
-            if isinstance(c, dict) and c.get("name") and c.get("role"):
-                queue_character_card(c["name"], c["role"])
+            if isinstance(c, dict) and c.get("name"):
+                role = c.get("oled_role") or c.get("role") or ""
+                if role:
+                    queue_character_card(c["name"], role)
 
-        display.show_page_summary(page_number, summary["summary"])
+        # Prefer the OLED-sized summary for the tiny screen.
+        display.show_page_summary(page_number, oled_summary or summary["summary"])
         STATE.touch()
     except ai.AIError as e:
         log.warning("Gemini unavailable during commit: %r", e)
@@ -174,6 +246,59 @@ def _commit_page(img: Image.Image, img_path: Path) -> None:
     except Exception as e:
         log.exception("commit failed: %r", e)
         display.show_status("Lumos", ["hiccup", "try again"])
+
+
+def _maybe_switch_book(img: Image.Image, img_path: Path) -> bool:
+    """Detect that the reader swapped to a different physical book mid-session.
+
+    Triggered only while we're in PHASE_READING and a frame's similarity to
+    the last committed frame has been below BOOK_SWITCH_SIMILARITY for at
+    least BOOK_SWITCH_HOLD_S seconds. Runs a fresh identify; if it reports a
+    different (title_key, author_key), we drop the current book context and
+    return True so the caller skips further processing this tick.
+    """
+    if STATE.last_committed is None:
+        return False
+    sim = camera.similarity(img, STATE.last_committed)
+    now = time.time()
+    if sim >= BOOK_SWITCH_SIMILARITY:
+        # content close enough to what we committed — not a new book
+        if STATE.dissimilar_since is not None:
+            with STATE.lock:
+                STATE.dissimilar_since = None
+        return False
+    if STATE.dissimilar_since is None:
+        with STATE.lock:
+            STATE.dissimilar_since = now
+        return False
+    if now - STATE.dissimilar_since < BOOK_SWITCH_HOLD_S:
+        return False
+    # Held dissimilar long enough — confirm with an identify.
+    try:
+        ident = ai.identify_book(img_path)
+    except ai.AIError as e:
+        log.warning("book-switch identify failed: %r", e)
+        with STATE.lock:
+            STATE.dissimilar_since = None
+        return False
+    new_tk, new_ak = db.normalize_identity(ident["title"], ident["author"])
+    if not new_tk or new_tk == "unknown":
+        # Still nothing clear under the lamp. Reset timer; stay in reading.
+        with STATE.lock:
+            STATE.dissimilar_since = None
+        return False
+    if new_tk == STATE.current_title_key and new_ak == STATE.current_author_key:
+        # Same book, reader just flipped to a very different-looking page.
+        with STATE.lock:
+            STATE.dissimilar_since = None
+        return False
+    log.info(
+        "book-switch: %r -> %r (sim=%.2f held %.1fs)",
+        STATE.book_title, ident["title"], sim, now - STATE.dissimilar_since,
+    )
+    STATE.reset_book()
+    STATE.set_phase(PHASE_HUNTING, reason="book changed")
+    return True
 
 
 def watch_loop() -> None:
@@ -215,6 +340,21 @@ def watch_loop() -> None:
                 time.sleep(max(0.0, CAPTURE_INTERVAL - dt))
                 continue
 
+            # While reading, check for a book-switch BEFORE running stability
+            # logic — if the reader swapped books, we reset to hunting and
+            # wait for fresh identify rather than accidentally summarizing
+            # the new book's pages under the old book's row.
+            if STATE.phase == PHASE_READING and not STATE.busy:
+                with STATE.lock:
+                    STATE.busy = True
+                try:
+                    if _maybe_switch_book(img, Path(str(path))):
+                        # Reset to hunting; the next tick will start over.
+                        continue
+                finally:
+                    with STATE.lock:
+                        STATE.busy = False
+
             if STATE.last_committed is None and STATE.pending_frame is None:
                 # first frame ever: treat it as the start of a pending commit
                 with STATE.lock:
@@ -241,7 +381,21 @@ def watch_loop() -> None:
                             STATE.pending_since = None
                             STATE.busy = True
                         try:
-                            _commit_page(committed, committed_path or Path(path))
+                            if STATE.book_id is None:
+                                # Strict scan flow: require N-in-a-row agreeing
+                                # identifies before committing a book. On the
+                                # commit call itself we also summarize this page.
+                                committed_ok = _try_identify_book(
+                                    committed, committed_path or Path(path)
+                                )
+                                if committed_ok:
+                                    _commit_page_read(
+                                        committed, committed_path or Path(path)
+                                    )
+                            else:
+                                _commit_page_read(
+                                    committed, committed_path or Path(path)
+                                )
                         finally:
                             with STATE.lock:
                                 STATE.busy = False
@@ -312,7 +466,7 @@ def idle_loop() -> None:
 
             if STATE.phase == PHASE_CONNECT:
                 if now - last_static_flush >= STATIC_REFRESH_S or last_static_flush == 0.0:
-                    display.show_qr(LIBRARY_URL, caption="scan to")
+                    display.show_qr(LIBRARY_URL)
                     last_static_flush = now
                     STATE.last_qr_at = now
                 time.sleep(1.0)
@@ -351,7 +505,7 @@ def idle_loop() -> None:
             # Re-flush caught_up periodically so we recover from any transient
             # I2C glitch or screen drift.
             if rotation_showing_card or now - last_static_flush >= STATIC_REFRESH_S:
-                display.show_caught_up(STATE.current_page, STATE.book_title)
+                display.show_caught_up(STATE.current_page, STATE.oled_title or STATE.book_title)
                 last_static_flush = now
                 rotation_showing_card = False
             time.sleep(1.0)
@@ -412,9 +566,13 @@ def handle_question() -> None:
             STATE.current_page if STATE.book_id else None,
             question,
             result["answer"],
+            result["oled_answer"],
             result["refused_as_spoiler"],
         )
-        display.show_answer(result["answer"], refused=result["refused_as_spoiler"])
+        display.show_answer(
+            result["oled_answer"] or result["answer"],
+            refused=result["refused_as_spoiler"],
+        )
     finally:
         with STATE.lock:
             STATE.busy = False
@@ -488,7 +646,7 @@ def main() -> None:
     threading.Thread(target=idle_loop, daemon=True, name="idle").start()
 
     # connect phase: show welcome QR immediately. Idle loop keeps it refreshed.
-    display.show_qr(LIBRARY_URL, caption="scan to")
+    display.show_qr(LIBRARY_URL)
     log.info("Lumos ready (phase=%s). Ctrl-C to stop.", STATE.phase)
     try:
         while not STATE.shutdown:

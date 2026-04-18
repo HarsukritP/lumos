@@ -138,6 +138,36 @@ def api_debug_audio():
     return resp
 
 
+# ----- admin surface ------------------------------------------------------
+# These are unauthenticated on purpose (single-user device on LAN). If you
+# ever expose Lumos beyond the home network, put auth in front of /api/admin.
+
+@app.get("/api/admin/stats")
+def api_admin_stats():
+    """Row counts per table + on-disk footprint for the SQLite DB."""
+    return jsonify(db.stats())
+
+
+@app.get("/api/admin/tables")
+def api_admin_tables():
+    """Raw dump of each user-visible table (capped at 200 rows/table)."""
+    return jsonify(db.dump_tables())
+
+
+@app.post("/api/admin/reset")
+def api_admin_reset():
+    """Wipe all books/pages/questions. Drops the in-memory book context so
+    the watch loop returns to HUNTING and can scan a fresh cover."""
+    try:
+        from state import PHASE_HUNTING, STATE
+        STATE.reset_book()
+        STATE.set_phase(PHASE_HUNTING, reason="admin reset")
+    except Exception as e:
+        log.warning("state reset during admin reset failed: %r", e)
+    result = db.reset()
+    return jsonify({"ok": True, **result})
+
+
 # ----- PWA static + SPA fallback ------------------------------------------
 
 def _static_root() -> Path:

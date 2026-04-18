@@ -47,6 +47,16 @@ async function api(path) {
   return r.json();
 }
 
+async function apiPost(path, body) {
+  const r = await fetch(API + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : null,
+  });
+  if (!r.ok) throw new Error(`${path} ${r.status}`);
+  return r.json();
+}
+
 // --- router ------------------------------------------------------------
 const routes = [
   { match: /^#?\/?$/,                   render: renderLibrary, tab: 'library' },
@@ -458,6 +468,72 @@ async function renderDebug() {
   audioWrap.appendChild(aud);
   app.appendChild(audioWrap);
 
+  // --- identify trail (scan confirmations)
+  const trailWrap = el('div', { class: 'debug-trail' });
+  trailWrap.appendChild(el('h3', {}, 'identify trail'));
+  const trailBody = el('div', { class: 'trail-body' }, el('div', { class: 'empty small' }, 'no attempts yet'));
+  trailWrap.appendChild(trailBody);
+  app.appendChild(trailWrap);
+
+  // --- storage stats panel
+  const statsWrap = el('div', { class: 'debug-stats' });
+  statsWrap.appendChild(el('h3', {}, 'storage'));
+  const statsBody = el('div', { class: 'debug-grid' });
+  statsBody.appendChild(el('div', { class: 'debug-row' }, el('span', { class: 'debug-label' }, 'loading\u2026')));
+  statsWrap.appendChild(statsBody);
+  app.appendChild(statsWrap);
+
+  // --- danger zone (reset)
+  const resetWrap = el('div', { class: 'debug-danger' });
+  resetWrap.appendChild(el('h3', {}, 'reset data'));
+  resetWrap.appendChild(el('p', { class: 'small' }, 'wipes every book, page, and question. irreversible.'));
+  const btnRow = el('div', { class: 'btn-row' });
+  const btnReset = el('button', { class: 'btn danger', type: 'button' }, 'reset all data');
+  const btnConfirm = el('button', { class: 'btn danger solid hidden', type: 'button' }, 'yes, wipe it');
+  const btnCancel = el('button', { class: 'btn ghost hidden', type: 'button' }, 'cancel');
+  btnRow.append(btnReset, btnConfirm, btnCancel);
+  const resetResult = el('div', { class: 'debug-result' });
+  resetWrap.append(btnRow, resetResult);
+  app.appendChild(resetWrap);
+
+  btnReset.addEventListener('click', () => {
+    btnReset.classList.add('hidden');
+    btnConfirm.classList.remove('hidden');
+    btnCancel.classList.remove('hidden');
+    resetResult.textContent = '';
+    resetResult.className = 'debug-result';
+  });
+  btnCancel.addEventListener('click', () => {
+    btnReset.classList.remove('hidden');
+    btnConfirm.classList.add('hidden');
+    btnCancel.classList.add('hidden');
+  });
+  btnConfirm.addEventListener('click', async () => {
+    btnConfirm.disabled = true; btnCancel.disabled = true;
+    try {
+      const r = await apiPost('/api/admin/reset');
+      const b = r.before?.counts || {}, a = r.after?.counts || {};
+      resetResult.textContent = `wiped \u2192 books ${b.books||0}\u2192${a.books||0}, pages ${b.pages||0}\u2192${a.pages||0}, questions ${b.questions||0}\u2192${a.questions||0}`;
+      resetResult.classList.add('ok');
+    } catch (e) {
+      resetResult.textContent = 'reset failed: ' + (e.message || e);
+      resetResult.classList.add('bad');
+    } finally {
+      btnConfirm.disabled = false; btnCancel.disabled = false;
+      btnReset.classList.remove('hidden');
+      btnConfirm.classList.add('hidden');
+      btnCancel.classList.add('hidden');
+      refreshStats(); refreshTables();
+    }
+  });
+
+  // --- sqlite tables inspector
+  const tablesWrap = el('div', { class: 'debug-tables' });
+  tablesWrap.appendChild(el('h3', {}, 'sqlite tables'));
+  const tablesBody = el('div', {}, el('div', { class: 'empty small' }, 'loading\u2026'));
+  tablesWrap.appendChild(tablesBody);
+  app.appendChild(tablesWrap);
+
   const fmtTs = (ts) => {
     if (!ts) return '\u2014';
     const d = (Date.now() / 1000) - ts;
@@ -465,6 +541,98 @@ async function renderDebug() {
     if (d < 60) return Math.floor(d) + 's ago';
     if (d < 3600) return Math.floor(d / 60) + 'm ago';
     return Math.floor(d / 3600) + 'h ago';
+  };
+
+  const paintTrail = (trail) => {
+    trailBody.innerHTML = '';
+    if (!trail?.length) {
+      trailBody.appendChild(el('div', { class: 'empty small' }, 'no attempts yet'));
+      return;
+    }
+    for (const t of trail.slice().reverse()) {
+      const conf = (t.conf ?? 0);
+      const klass = conf >= 0.55 ? 'ok' : (conf >= 0.35 ? 'warn' : 'bad');
+      trailBody.appendChild(el('div', { class: 'trail-row' },
+        el('span', { class: 'mono ' + klass }, (conf * 100).toFixed(0) + '%'),
+        el('span', { class: 'trail-title' }, t.title_key || '—'),
+        el('span', { class: 'trail-author small' }, t.author_key || ''),
+        el('span', { class: 'trail-age small mono' }, fmtTs((Date.now() / 1000) - t.age_s)),
+      ));
+    }
+  };
+
+  const refreshStats = async () => {
+    try {
+      const s = await api('/api/admin/stats');
+      statsBody.innerHTML = '';
+      const kb = (s.size_bytes / 1024).toFixed(1);
+      const rows = [
+        ['db path',   s.db_path],
+        ['schema',    'v' + s.schema_version],
+        ['size',      kb + ' KB'],
+        ['books',     String(s.counts.books ?? 0)],
+        ['pages',     String(s.counts.pages ?? 0)],
+        ['questions', String(s.counts.questions ?? 0)],
+      ];
+      for (const [k, v] of rows) {
+        statsBody.appendChild(el('div', { class: 'debug-row' },
+          el('span', { class: 'debug-label' }, k),
+          el('span', { class: 'debug-value mono' }, v),
+        ));
+      }
+    } catch {
+      statsBody.innerHTML = '';
+      statsBody.appendChild(el('div', { class: 'debug-row' },
+        el('span', { class: 'debug-label' }, 'storage'),
+        el('span', { class: 'debug-value mono bad' }, 'offline'),
+      ));
+    }
+  };
+
+  const refreshTables = async () => {
+    try {
+      const d = await api('/api/admin/tables');
+      tablesBody.innerHTML = '';
+      for (const [name, t] of Object.entries(d)) {
+        const sec = el('details', { class: 'table-section' });
+        const sum = el('summary', {},
+          el('strong', {}, name),
+          el('span', { class: 'count' }, String(t.count ?? 0)),
+        );
+        sec.appendChild(sum);
+        if (t.error) {
+          sec.appendChild(el('div', { class: 'empty small' }, t.error));
+        } else if (!t.rows?.length) {
+          sec.appendChild(el('div', { class: 'empty small' }, 'empty'));
+        } else {
+          const tbl = el('table', { class: 'db-table' });
+          const thead = el('thead'); const trh = el('tr');
+          for (const c of t.columns) trh.appendChild(el('th', {}, c));
+          thead.appendChild(trh); tbl.appendChild(thead);
+          const tbody = el('tbody');
+          for (const row of t.rows) {
+            const tr = el('tr');
+            for (const c of t.columns) {
+              const v = row[c];
+              let text;
+              if (v === null || v === undefined) text = '\u2014';
+              else if (typeof v === 'number' && c.endsWith('_at') && v > 1e9) text = new Date(v * 1000).toLocaleString();
+              else if (typeof v === 'object') text = JSON.stringify(v);
+              else text = String(v);
+              if (text.length > 80) text = text.slice(0, 79) + '\u2026';
+              tr.appendChild(el('td', {}, text));
+            }
+            tbody.appendChild(tr);
+          }
+          tbl.appendChild(tbody);
+          sec.appendChild(el('div', { class: 'table-scroll' }, tbl));
+        }
+        tablesBody.appendChild(sec);
+      }
+    } catch {
+      tablesBody.innerHTML = '';
+      tablesBody.appendChild(el('div', { class: 'empty small' }, 'device offline'));
+    }
   };
 
   const refresh = async () => {
@@ -482,12 +650,15 @@ async function renderDebug() {
       vMean.textContent = (s.last_capture_mean ?? 0).toFixed(1);
       vCaptured.textContent = fmtTs(s.last_capture_at);
       vCommitted.textContent = fmtTs(s.last_commit_at);
+      paintTrail(s.identify_trail);
     } catch (e) {
       vPhase.textContent = 'offline';
     }
   };
 
-  await refresh();
+  await Promise.all([refresh(), refreshStats(), refreshTables()]);
   onView(refresh, 1500);
+  onView(refreshStats, 5000);
+  onView(refreshTables, 8000);
   return app;
 }

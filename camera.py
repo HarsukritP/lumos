@@ -29,10 +29,24 @@ class CameraError(RuntimeError):
     pass
 
 
-def capture(out_path: Path | str = FRAME_PATH, timeout_ms: int = CAMERA_TIMEOUT_MS) -> Path:
-    """Block until `rpicam-still` produces a JPEG at `out_path`. Return the path."""
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
+def _kill_stale_rpicam() -> None:
+    """rpicam-still occasionally wedges holding the camera sensor (seen after
+    the process is interrupted mid-capture or when a long-running peer thread
+    blocks the CPU). Any stale copy will make *every* subsequent capture time
+    out. Cheap insurance: fire a SIGKILL at anything still named rpicam-still
+    before we launch a new one."""
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-x", "rpicam-still"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+
+def _run_rpicam(out: Path, timeout_ms: int, hard_timeout_s: float) -> subprocess.CompletedProcess:
     cmd = [
         "rpicam-still",
         "-n",
@@ -42,20 +56,55 @@ def capture(out_path: Path | str = FRAME_PATH, timeout_ms: int = CAMERA_TIMEOUT_
         "--width", "1536",
         "--height", "864",
     ]
-    t0 = time.monotonic()
-    proc = subprocess.run(
+    return subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=hard_timeout_s,
         stdin=subprocess.DEVNULL,
     )
-    dt = time.monotonic() - t0
-    if proc.returncode != 0 or not out.exists():
-        raise CameraError(
-            f"rpicam-still failed ({proc.returncode}) after {dt:.1f}s: {proc.stderr[-300:]}"
-        )
-    return out
+
+
+def capture(out_path: Path | str = FRAME_PATH, timeout_ms: int = CAMERA_TIMEOUT_MS) -> Path:
+    """Block until `rpicam-still` produces a JPEG at `out_path`. Return the path.
+
+    Auto-recovers from wedged rpicam-still processes by SIGKILLing stale
+    copies and retrying once with a slightly longer warm-up."""
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    for attempt in (1, 2):
+        t0 = time.monotonic()
+        try:
+            proc = _run_rpicam(out, timeout_ms=timeout_ms, hard_timeout_s=15.0)
+        except subprocess.TimeoutExpired as e:
+            # A stuck rpicam will keep the sensor locked until we kill it.
+            _kill_stale_rpicam()
+            if attempt == 2:
+                raise CameraError(
+                    f"rpicam-still hung for {15.0:.0f}s (killed); giving up"
+                ) from e
+            # Let the kernel hand the camera back, then retry.
+            time.sleep(0.5)
+            continue
+
+        dt = time.monotonic() - t0
+        if proc.returncode == 0 and out.exists():
+            return out
+
+        _kill_stale_rpicam()
+        if attempt == 2:
+            raise CameraError(
+                f"rpicam-still failed ({proc.returncode}) after {dt:.1f}s: "
+                f"{(proc.stderr or '')[-300:]}"
+            )
+        # First failure — short pause and try once more with a little more
+        # warm-up time so the sensor AE/AWB has a chance to stabilize.
+        time.sleep(0.3)
+        timeout_ms = max(timeout_ms, 800)
+
+    # Unreachable: both attempts either returned or raised above.
+    raise CameraError("rpicam-still: exhausted retries")
 
 
 def load_oriented(path: Path | str) -> Image.Image:
