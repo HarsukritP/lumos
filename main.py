@@ -791,6 +791,21 @@ def _on_button_up() -> None:
         _ptt_rec = None
     # Leave the lock before doing heavy work.
 
+    # Check elapsed BEFORE trying to finalize the WAV. On a quick tap
+    # arecord may not have even written the file header, so stop() would
+    # raise AudioError. Kill the process cheaply instead.
+    if rec.elapsed() < PTT_MIN_SECONDS:
+        log.info("PTT too short (%.2fs), discarding", rec.elapsed())
+        try:
+            rec.stop()
+        except audio.AudioError:
+            # Expected — file may not exist after a sub-second recording.
+            pass
+        with STATE.lock:
+            STATE.busy = False
+        display.show_status("Lumos", ["press &", "hold to talk"])
+        return
+
     try:
         wav = rec.stop()
     except audio.AudioError as e:
@@ -798,13 +813,6 @@ def _on_button_up() -> None:
         with STATE.lock:
             STATE.busy = False
         display.show_status("Lumos", ["mic error", "try again"])
-        return
-
-    if rec.elapsed() < PTT_MIN_SECONDS:
-        log.info("PTT too short (%.2fs), discarding", rec.elapsed())
-        with STATE.lock:
-            STATE.busy = False
-        display.show_status("Lumos", ["press &", "hold to talk"])
         return
 
     threading.Thread(

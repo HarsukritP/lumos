@@ -121,37 +121,68 @@ class PTTRecorder:
         return self.proc is not None and self.proc.poll() is None
 
     def stop(self) -> Path:
-        """Terminate the running capture (if any), wait up to ~1.5s for
-        arecord to flush the WAV, and return the output path. Raises
-        AudioError if the resulting file is missing / truncated."""
+        """Terminate the running capture (if any), wait for arecord to flush
+        the WAV, and return the output path. Raises AudioError if the file
+        never materialized or is clearly empty.
+
+        arecord traps SIGINT and finalizes the WAV header on the way out,
+        but on a loaded Pi Zero 2 W that tear-down can take 1-2 seconds.
+        We wait up to 3s for graceful exit before escalating to SIGKILL,
+        and after any exit we poll the filesystem for ~1s in case the
+        write hadn't hit the page cache yet when we checked."""
         if self.proc is None:
             raise AudioError("PTTRecorder never started")
         if self.stopped_at:
             return self.out_path  # idempotent
 
         try:
-            # SIGINT = cleanest: arecord traps it and finalizes the WAV.
             self.proc.send_signal(signal.SIGINT)
         except ProcessLookupError:
             pass
+        graceful = True
         try:
-            self.proc.wait(timeout=1.5)
+            self.proc.wait(timeout=3.0)
         except subprocess.TimeoutExpired:
+            graceful = False
             log.warning("arecord did not exit on SIGINT; killing")
             try:
                 self.proc.kill()
-                self.proc.wait(timeout=0.5)
+                self.proc.wait(timeout=1.0)
             except Exception:
                 pass
         self.stopped_at = time.monotonic()
 
-        # Even on a clean SIGINT arecord occasionally reports a nonzero exit
-        # code; what we really care about is the WAV.
+        # Drain stderr so we can surface ALSA diagnostics on failure.
+        stderr_tail = ""
+        try:
+            if self.proc.stderr is not None:
+                raw = self.proc.stderr.read() or b""
+                stderr_tail = raw.decode(errors="replace").strip()[-400:]
+        except Exception:
+            pass
+        if self.proc.returncode not in (0, -signal.SIGINT, -signal.SIGKILL):
+            log.warning(
+                "arecord exit=%s graceful=%s stderr=%r",
+                self.proc.returncode, graceful, stderr_tail,
+            )
+
+        # Poll briefly for the file — the filesystem write can lag a bit
+        # behind arecord's exit on a busy Pi.
+        deadline = time.monotonic() + 1.0
+        while not self.out_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+
         if not self.out_path.exists():
-            raise AudioError(f"PTT produced no file at {self.out_path}")
+            raise AudioError(
+                f"PTT produced no file at {self.out_path} "
+                f"(arecord exit={self.proc.returncode}; stderr={stderr_tail!r})"
+            )
         size = self.out_path.stat().st_size
         if size < 2048:  # < ~21ms at 48kHz/2ch/S32 — treat as noise/misfire
-            raise AudioError(f"PTT wav too short ({size} bytes)")
+            raise AudioError(
+                f"PTT wav too short ({size} bytes; "
+                f"arecord exit={self.proc.returncode}; stderr={stderr_tail!r})"
+            )
         log.info(
             "PTT stop: %.2fs recorded, %d bytes -> %s",
             self.elapsed(), size, self.out_path,

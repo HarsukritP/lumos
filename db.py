@@ -518,9 +518,26 @@ def dump_tables(limit_per_table: int = 200) -> dict:
 # ----- smoke test ----------------------------------------------------------
 
 if __name__ == "__main__":
+    # IMPORTANT: run the smoke against a throwaway DB file so a crash mid-
+    # test can't leave fake books in ~/lumos.db. Previously this used the
+    # real DB and relied on a cleanup DELETE that was skipped on failure.
+    import os
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="lumos_db_smoke_"))
+    os.environ["LUMOS_DB"] = str(tmp / "smoke.db")
+    # Re-point the module-level DB_PATH for this process.
+    import config
+    config.DB_PATH = Path(os.environ["LUMOS_DB"])
+    globals()["DB_PATH"] = config.DB_PATH
+    # Drop any cached connection from prior imports.
+    _conn = None
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     init_db()
+    print("db:", config.DB_PATH)
     print("stats:", stats())
+
     b = find_or_create_book_by_identity(
         "The Brothers Karamazov", "Fyodor Dostoevsky", is_textbook=False,
         cover_phash="smoke_abc123",
@@ -534,7 +551,7 @@ if __name__ == "__main__":
     )
     assert b2["id"] == b["id"], f"dedup broken: {b['id']} vs {b2['id']}"
     print("dedup ok (case + punctuation + whitespace tolerant)")
-    pid = add_page(
+    add_page(
         b["id"], 312,
         "Ivan's anxiety sharpens as the evening cools over the courtyard.",
         "Ivan tense in courtyard.",
@@ -546,9 +563,10 @@ if __name__ == "__main__":
                  "Ivan: middle brother, rationalist.", False)
     print("recent:", recent_summaries(b["id"]))
     print("vocab:", all_vocab())
-    # Clean up so this row doesn't pollute a real DB
-    with _lock:
-        conn().execute("DELETE FROM books WHERE id=?", (b["id"],))
-        conn().commit()
-    print("stats after cleanup:", stats()["counts"])
-    print("OK")
+
+    # Throwaway DB; just nuke the whole directory.
+    import shutil
+    if _conn is not None:
+        _conn.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("OK (smoke DB removed)")
