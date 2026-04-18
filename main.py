@@ -333,195 +333,165 @@ def _maybe_switch_book(img: Image.Image, img_path: Path) -> bool:
 
 def watch_loop() -> None:
     log.info("watch loop starting")
+    tick = 0
     while not STATE.shutdown:
         t0 = time.monotonic()
         try:
             if STATE.busy:
-                time.sleep(0.2)
+                time.sleep(0.3)
                 continue
+
+            cap_t0 = time.monotonic()
             path = camera.capture(FRAME_PATH)
             img = camera.load_oriented(path)
-            var, mean = camera.page_score(img)
+            cap_dt = time.monotonic() - cap_t0
+            scores = camera.page_score(img)
             ok, reason = camera.is_likely_page(img)
             with STATE.lock:
                 STATE.last_capture_at = time.time()
-                STATE.last_capture_var = var
-                STATE.last_capture_mean = mean
+                STATE.last_capture_var = scores["laplacian_var"]
+                STATE.last_capture_mean = scores["mean"]
+                STATE.last_capture_bright_frac = scores["bright_frac"]
                 STATE.last_capture_ok = ok
                 STATE.last_capture_reason = reason
+                STATE.last_capture_dt = cap_dt
 
-            # In connect phase, we still capture (so the debug view is live),
-            # but we don't try to commit / identify anything.
-            if STATE.phase == PHASE_CONNECT:
-                dt = time.monotonic() - t0
-                time.sleep(max(0.0, CAPTURE_INTERVAL - dt))
-                continue
-
-            # Resume prompt auto-dismiss on timeout. If the reader never flips
-            # to their last page within RESUME_TIMEOUT_S, drop the prompt and
-            # let the next stable frame commit as a fresh page.
-            if (
-                STATE.awaiting_resume
-                and STATE.awaiting_resume_since
-                and time.time() - STATE.awaiting_resume_since >= RESUME_TIMEOUT_S
-            ):
+            tick += 1
+            if tick % 5 == 1:
                 log.info(
-                    "resume prompt auto-dismissed (%.0fs elapsed)",
-                    time.time() - STATE.awaiting_resume_since,
+                    "watch tick=%d cap=%.1fs likely=%s (%s)",
+                    tick, cap_dt, ok, reason,
                 )
-                with STATE.lock:
-                    STATE.awaiting_resume = False
 
-            if not ok:
-                # Not book-like; don't let it become pending, don't call Gemini.
+            if STATE.phase == PHASE_CONNECT:
+                # Still capture for the debug view, but don't identify.
+                pass  # fall through to unified sleep at bottom
+            elif not ok:
                 log.debug("skipping frame: %s", reason)
-                # If we had a pending candidate waiting to stabilize, drop it.
                 if STATE.pending_frame is not None:
                     with STATE.lock:
                         STATE.pending_frame = None
                         STATE.pending_path = None
                         STATE.pending_since = None
-                dt = time.monotonic() - t0
-                time.sleep(max(0.0, CAPTURE_INTERVAL - dt))
-                continue
-
-            # While reading, check for a book-switch BEFORE running stability
-            # logic — if the reader swapped books, we reset to hunting and
-            # wait for fresh identify rather than accidentally summarizing
-            # the new book's pages under the old book's row.
-            if STATE.phase == PHASE_READING and not STATE.busy:
-                with STATE.lock:
-                    STATE.busy = True
-                try:
-                    if _maybe_switch_book(img, Path(str(path))):
-                        # Reset to hunting; the next tick will start over.
-                        continue
-                finally:
-                    with STATE.lock:
-                        STATE.busy = False
-
-            if STATE.last_committed is None and STATE.pending_frame is None:
-                # first frame ever: treat it as the start of a pending commit
-                with STATE.lock:
-                    STATE.pending_frame = img
-                    STATE.pending_path = Path(str(path))
-                    STATE.pending_since = time.time()
             else:
-                ref = STATE.pending_frame or STATE.last_committed
-                sim = camera.similarity(img, ref)
+                # Resume prompt auto-dismiss on timeout.
+                if (
+                    STATE.awaiting_resume
+                    and STATE.awaiting_resume_since
+                    and time.time() - STATE.awaiting_resume_since >= RESUME_TIMEOUT_S
+                ):
+                    log.info(
+                        "resume prompt auto-dismissed (%.0fs elapsed)",
+                        time.time() - STATE.awaiting_resume_since,
+                    )
+                    with STATE.lock:
+                        STATE.awaiting_resume = False
 
-                if sim >= SIMILARITY_THRESHOLD:
-                    # same as what we were watching
-                    if (
-                        STATE.pending_frame is not None
-                        and STATE.pending_since is not None
-                        and time.time() - STATE.pending_since >= PAGE_STABILITY_TIME
-                    ):
-                        committed = STATE.pending_frame
-                        committed_path = STATE.pending_path
+                # Book-switch check BEFORE stability logic.
+                if STATE.phase == PHASE_READING and not STATE.busy:
+                    with STATE.lock:
+                        STATE.busy = True
+                    try:
+                        if _maybe_switch_book(img, Path(str(path))):
+                            continue
+                    finally:
                         with STATE.lock:
-                            STATE.last_committed = committed
-                            STATE.pending_frame = None
-                            STATE.pending_path = None
-                            STATE.pending_since = None
-                            STATE.busy = True
-                        try:
-                            if STATE.book_id is None:
-                                # Strict scan flow: require N-in-a-row agreeing
-                                # identifies before committing a book. Once
-                                # we've committed, only summarize this frame
-                                # if we're NOT entering the resume-prompt
-                                # state (which we enter when the book was
-                                # previously read past page 0).
-                                committed_ok = _try_identify_book(
-                                    committed, committed_path or Path(path)
-                                )
-                                if committed_ok and not STATE.awaiting_resume:
-                                    _commit_page_read(
+                            STATE.busy = False
+
+                if STATE.last_committed is None and STATE.pending_frame is None:
+                    with STATE.lock:
+                        STATE.pending_frame = img
+                        STATE.pending_path = Path(str(path))
+                        STATE.pending_since = time.time()
+                else:
+                    ref = STATE.pending_frame or STATE.last_committed
+                    sim = camera.similarity(img, ref)
+
+                    if sim >= SIMILARITY_THRESHOLD:
+                        if (
+                            STATE.pending_frame is not None
+                            and STATE.pending_since is not None
+                            and time.time() - STATE.pending_since >= PAGE_STABILITY_TIME
+                        ):
+                            committed = STATE.pending_frame
+                            committed_path = STATE.pending_path
+                            with STATE.lock:
+                                STATE.last_committed = committed
+                                STATE.pending_frame = None
+                                STATE.pending_path = None
+                                STATE.pending_since = None
+                                STATE.busy = True
+                            try:
+                                if STATE.book_id is None:
+                                    committed_ok = _try_identify_book(
                                         committed, committed_path or Path(path)
                                     )
-                            elif STATE.awaiting_resume:
-                                # Book is identified and we're waiting for
-                                # the reader to flip to their last-known page.
-                                # OCR the committed frame; only exit resume
-                                # when the printed page number is >= the
-                                # resume target (they've caught up, or gone
-                                # past it). Otherwise stay waiting; don't
-                                # call Gemini.
-                                pn_local = _safe_ocr_page(committed)
-                                with STATE.lock:
-                                    STATE.last_detected_page = pn_local
-                                target = STATE.resume_target_page
-                                if pn_local is not None and pn_local >= target:
-                                    log.info(
-                                        "resume satisfied: on p.%d (target p.%d)",
-                                        pn_local, target,
-                                    )
-                                    with STATE.lock:
-                                        STATE.awaiting_resume = False
-                                        STATE.current_page = pn_local
-                                    _commit_page_read(
-                                        committed, committed_path or Path(path)
-                                    )
-                                else:
-                                    log.info(
-                                        "still awaiting resume (ocr=%r, target=p.%d)",
-                                        pn_local, target,
-                                    )
-                            else:
-                                # Dedup guards — both avoid a Gemini call on
-                                # the common "same page as before" case.
-                                #
-                                # Layer 1 (pixel): near-identical NCC
-                                # similarity to last_committed. Catches
-                                # jitter/lighting re-stabilizations.
-                                #
-                                # Layer 2 (OCR): if pixel sim dropped enough
-                                # to look like a new page but local OCR
-                                # reports the same printed page number as
-                                # STATE.current_page, that's the same
-                                # spread under the lamp — skip Gemini.
-                                if STATE.last_committed is not None and \
-                                    camera.similarity(
-                                        committed, STATE.last_committed
-                                    ) >= DEDUP_SIMILARITY:
-                                    log.info("skip commit: pixel-dedup hit")
-                                    with STATE.lock:
-                                        STATE.last_committed = committed
-                                else:
-                                    pn_local = _safe_ocr_page(committed)
-                                    with STATE.lock:
-                                        STATE.last_detected_page = pn_local
-                                    if (
-                                        pn_local is not None
-                                        and STATE.current_page
-                                        and pn_local == STATE.current_page
-                                    ):
-                                        log.info(
-                                            "skip commit: OCR-dedup hit "
-                                            "(printed p.%d == current p.%d)",
-                                            pn_local, STATE.current_page,
-                                        )
-                                        with STATE.lock:
-                                            STATE.last_committed = committed
-                                    else:
+                                    if committed_ok and not STATE.awaiting_resume:
                                         _commit_page_read(
                                             committed, committed_path or Path(path)
                                         )
-                        finally:
-                            with STATE.lock:
-                                STATE.busy = False
-                else:
-                    # new content — save as pending
-                    pending_copy = PENDING_PATH
-                    try:
-                        img.save(pending_copy, format="JPEG", quality=85)
-                    except Exception:
-                        pass
-                    with STATE.lock:
-                        STATE.pending_frame = img
-                        STATE.pending_path = pending_copy
-                        STATE.pending_since = time.time()
+                                elif STATE.awaiting_resume:
+                                    pn_local = _safe_ocr_page(committed)
+                                    with STATE.lock:
+                                        STATE.last_detected_page = pn_local
+                                    target = STATE.resume_target_page
+                                    if pn_local is not None and pn_local >= target:
+                                        log.info(
+                                            "resume satisfied: on p.%d (target p.%d)",
+                                            pn_local, target,
+                                        )
+                                        with STATE.lock:
+                                            STATE.awaiting_resume = False
+                                            STATE.current_page = pn_local
+                                        _commit_page_read(
+                                            committed, committed_path or Path(path)
+                                        )
+                                    else:
+                                        log.info(
+                                            "still awaiting resume (ocr=%r, target=p.%d)",
+                                            pn_local, target,
+                                        )
+                                else:
+                                    if STATE.last_committed is not None and \
+                                        camera.similarity(
+                                            committed, STATE.last_committed
+                                        ) >= DEDUP_SIMILARITY:
+                                        log.info("skip commit: pixel-dedup hit")
+                                        with STATE.lock:
+                                            STATE.last_committed = committed
+                                    else:
+                                        pn_local = _safe_ocr_page(committed)
+                                        with STATE.lock:
+                                            STATE.last_detected_page = pn_local
+                                        if (
+                                            pn_local is not None
+                                            and STATE.current_page
+                                            and pn_local == STATE.current_page
+                                        ):
+                                            log.info(
+                                                "skip commit: OCR-dedup hit "
+                                                "(printed p.%d == current p.%d)",
+                                                pn_local, STATE.current_page,
+                                            )
+                                            with STATE.lock:
+                                                STATE.last_committed = committed
+                                        else:
+                                            _commit_page_read(
+                                                committed, committed_path or Path(path)
+                                            )
+                            finally:
+                                with STATE.lock:
+                                    STATE.busy = False
+                    else:
+                        pending_copy = PENDING_PATH
+                        try:
+                            img.save(pending_copy, format="JPEG", quality=85)
+                        except Exception:
+                            pass
+                        with STATE.lock:
+                            STATE.pending_frame = img
+                            STATE.pending_path = pending_copy
+                            STATE.pending_since = time.time()
         except camera.CameraError as e:
             log.warning("camera error: %r", e)
             time.sleep(1.0)
@@ -670,7 +640,7 @@ def _ptt_footer_ticker() -> None:
             _ptt_body_context(),
             f"\u25cf rec {elapsed:04.1f}s",
         )
-        if stop.wait(0.5):
+        if stop.wait(0.25):
             break
 
 
@@ -720,21 +690,27 @@ def _on_button_down() -> None:
             )
             return
 
-        # Scenario 3: real PTT. Start recording + footer ticker.
+        # Scenario 3: real PTT. Show "listening" IMMEDIATELY then start recording.
+        with STATE.lock:
+            STATE.busy = True
+        STATE.touch()
+        display.show_ptt_footer(
+            _ptt_body_context(),
+            "\u25cf listening\u2026",
+        )
         try:
             _ptt_rec = audio.PTTRecorder(out_path=QUESTION_WAV)
             _ptt_rec.start()
         except audio.AudioError as e:
             log.warning("PTT start failed: %r", e)
             _ptt_rec = None
+            with STATE.lock:
+                STATE.busy = False
             display.show_ptt_footer(
                 _ptt_body_context(),
                 "mic error",
             )
             return
-        with STATE.lock:
-            STATE.busy = True
-        STATE.touch()
         _ptt_footer_stop = threading.Event()
         threading.Thread(
             target=_ptt_footer_ticker,
@@ -825,40 +801,33 @@ def _on_button_up() -> None:
 
 
 def _handle_ptt_answer(wav_path: Path) -> None:
-    """Transcribe the PTT wav, call Gemini for an answer, persist, render."""
+    """Single Gemini call: transcribe + answer in one round-trip."""
     try:
-        display.show_status("Lumos", ["transcribing\u2026"])
-        try:
-            question = ai.transcribe_audio(wav_path)
-        except ai.AIError as e:
-            log.warning("transcribe failed: %r", e)
-            display.show_status("Lumos", ["no signal,", "couldn't hear"])
-            return
-        if not question:
-            display.show_status("Lumos", ["didn't catch", "that, again?"])
-            return
-        log.info("ptt question: %r", question)
-
         display.show_status("Lumos", ["thinking\u2026"])
-        try:
-            path = camera.capture(FRAME_PATH)
-        except camera.CameraError:
-            path = None
         summaries = (
             db.recent_summaries(STATE.book_id, 5) if STATE.book_id else []
         )
+        # Use last known frame path if available; skip a fresh capture to
+        # eliminate the 3-4s rpicam-still overhead from the PTT pipeline.
+        frame = FRAME_PATH if FRAME_PATH.exists() else None
         try:
-            result = ai.answer_question(
-                path,
-                question,
+            result = ai.transcribe_and_answer(
+                wav_path,
+                frame,
                 STATE.book_title,
                 STATE.current_page,
                 summaries,
             )
         except ai.AIError as e:
-            log.warning("answer failed: %r", e)
+            log.warning("transcribe+answer failed: %r", e)
             display.show_status("Lumos", ["no signal,", "try again"])
             return
+
+        question = result["question"]
+        if not question:
+            display.show_status("Lumos", ["didn't catch", "that, again?"])
+            return
+        log.info("ptt question=%r answer=%r", question, result["oled_answer"])
 
         db.add_question(
             STATE.book_id,
@@ -872,9 +841,6 @@ def _handle_ptt_answer(wav_path: Path) -> None:
             result["oled_answer"] or result["answer"],
             refused=result["refused_as_spoiler"],
         )
-        # Hold the answer on the OLED so the user can actually read it.
-        # STATE.busy stays True during this sleep, blocking the idle loop
-        # from overwriting the screen.
         time.sleep(ANSWER_DISPLAY_S)
     finally:
         with STATE.lock:

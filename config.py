@@ -24,6 +24,8 @@ QUESTION_WAV = TMP_DIR / "question.wav"
 
 CAMERA_ROTATION = 180
 CAMERA_TIMEOUT_MS = 500
+CAPTURE_WIDTH = 800
+CAPTURE_HEIGHT = 600
 
 BUTTON_PIN = 17
 
@@ -31,7 +33,7 @@ OLED_WIDTH = 128
 OLED_HEIGHT = 64
 OLED_I2C_ADDR = 0x3C
 
-CAPTURE_INTERVAL = 2.0
+CAPTURE_INTERVAL = 5.0
 PAGE_STABILITY_TIME = 3.0
 SIMILARITY_THRESHOLD = 0.75
 # Post-stability dedup: if a candidate commit's similarity to last_committed
@@ -46,6 +48,9 @@ DEDUP_SIMILARITY = 0.88
 PAGE_SCORE_MIN = 15.0         # Laplacian variance on a 128x128 grayscale
 PAGE_BRIGHTNESS_MIN = 40.0    # 0..255, reject very dark frames (mean)
 PAGE_BRIGHTNESS_MAX = 235.0   # reject blown-out white frames
+# Fraction of pixels with brightness > 160 (paper detection). Book pages
+# under a reading lamp have >0.35; covers >0.20; a random desk/room <0.16.
+PAGE_BRIGHT_FRAC_MIN = 0.20
 
 # If Gemini's book-identification confidence is below this, don't commit a
 # book row or summarize — we're probably looking at nothing/hands/noise.

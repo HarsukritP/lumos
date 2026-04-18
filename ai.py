@@ -366,6 +366,90 @@ def transcribe_audio(wav_path: Path | str) -> str:
     return raw.strip().strip('"').strip()
 
 
+def transcribe_and_answer(
+    wav_path: Path | str,
+    image_path: Path | str | None,
+    book_title: str,
+    current_page: int | None,
+    recent_summaries: list[dict],
+) -> dict:
+    """Single Gemini call: transcribe the audio question AND answer it.
+
+    Returns {
+      'question': str,         # the transcribed question
+      'answer': str,           # full answer for the app
+      'oled_answer': str,      # short answer for OLED
+      'refused_as_spoiler': bool
+    }
+
+    By combining transcription and answering into one request we eliminate
+    a full Gemini round-trip (upload+transcribe then answer), cutting PTT
+    latency roughly in half.
+    """
+    wav_path = Path(wav_path)
+    if not wav_path.exists() or wav_path.stat().st_size < 1024:
+        raise AIError(f"transcribe_and_answer: missing/empty file {wav_path}")
+    try:
+        uploaded = client().files.upload(file=str(wav_path))
+    except Exception as e:
+        raise AIError(f"file upload failed: {e!r}") from e
+
+    context_lines: list[str] = []
+    for s in sorted(recent_summaries, key=lambda r: r["page_number"]):
+        context_lines.append(f"[p.{s['page_number']}] {s['summary']}")
+    context = "\n".join(context_lines) if context_lines else "(no prior pages seen yet)"
+
+    prompt = (
+        "You are Lumos, an ambient reading companion clipped to a book.\n"
+        "The attached audio is a spoken question from the reader. "
+        "First transcribe the audio, then answer the question.\n\n"
+        f"BOOK: {book_title}\n"
+        f"READER IS CURRENTLY ON: page {current_page if current_page else '?'}\n\n"
+        "CONTEXT — summaries of pages the reader has already seen:\n"
+        f"{context}\n\n"
+        "STRICT SPOILER RULE:\n"
+        f"- You may ONLY use information about the book up to and including "
+        f"page {current_page if current_page else '?'}.\n"
+        "- If the question is about a character, event, or idea that first "
+        "appears AFTER this page, you MUST refuse by setting "
+        '"refused_as_spoiler": true and replying something warm like '
+        '"we haven\'t gotten there yet — ask me again once we do."\n'
+        "- Do not reveal plot points, deaths, twists, or outcomes that occur "
+        "past the current page, even if you're confident about them.\n"
+        "- If the question is about earlier content in the book, answer helpfully.\n"
+        "- If the question is unrelated to the book (weather, math), answer briefly.\n\n"
+        "Return JSON ONLY with this shape:\n"
+        "{\n"
+        '  "question": "the verbatim transcription of the audio",\n'
+        '  "answer": "1-3 sentences, for a phone app",\n'
+        f'  "oled_answer": "<= {OLED_ANSWER_MAX} chars, for a 128x64 OLED; '
+        "plain text, no markdown, no lists, no quotes\",\n"
+        '  "refused_as_spoiler": bool\n'
+        "}\n"
+        "If the audio is silent or completely unintelligible, set "
+        '"question": "" and "answer": "". No prose outside the JSON.'
+    )
+    parts: list[Any] = [uploaded]
+    if image_path:
+        try:
+            parts.append(_image_part(image_path))
+        except Exception as e:
+            log.warning("couldn't attach image to question: %r", e)
+    parts.append(prompt)
+
+    raw = _call(parts, temperature=0.3)
+    data = _extract_json(raw)
+    question = str(data.get("question") or "").strip()
+    long_answer = str(data.get("answer") or "").strip()
+    oled_answer = _clamp(data.get("oled_answer") or long_answer, OLED_ANSWER_MAX)
+    return {
+        "question": question,
+        "answer": long_answer or "(no answer)",
+        "oled_answer": oled_answer,
+        "refused_as_spoiler": bool(data.get("refused_as_spoiler", False)),
+    }
+
+
 # ----- smoke test ----------------------------------------------------------
 
 if __name__ == "__main__":

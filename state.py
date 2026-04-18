@@ -56,8 +56,10 @@ class State:
         self.last_capture_at: float = 0.0
         self.last_capture_var: float = 0.0
         self.last_capture_mean: float = 0.0
+        self.last_capture_bright_frac: float = 0.0
         self.last_capture_ok: bool = False
         self.last_capture_reason: str = ""
+        self.last_capture_dt: float = 0.0
 
         # strict book-scan state
         # last N identify attempts as (title_key, author_key, confidence, ts)
@@ -124,8 +126,10 @@ class State:
             "last_capture_at": self.last_capture_at,
             "last_capture_var": self.last_capture_var,
             "last_capture_mean": self.last_capture_mean,
+            "last_capture_bright_frac": self.last_capture_bright_frac,
             "last_capture_ok": self.last_capture_ok,
             "last_capture_reason": self.last_capture_reason,
+            "last_capture_dt": self.last_capture_dt,
             "last_commit_at": self.last_commit_at,
             "uptime_s": time.time() - self.started_at,
             "identify_trail": trail,

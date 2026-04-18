@@ -16,9 +16,12 @@ from PIL import Image
 from config import (
     CAMERA_ROTATION,
     CAMERA_TIMEOUT_MS,
+    CAPTURE_WIDTH,
+    CAPTURE_HEIGHT,
     FRAME_PATH,
     PAGE_BRIGHTNESS_MAX,
     PAGE_BRIGHTNESS_MIN,
+    PAGE_BRIGHT_FRAC_MIN,
     PAGE_SCORE_MIN,
     PENDING_PATH,
     TMP_DIR,
@@ -53,8 +56,8 @@ def _run_rpicam(out: Path, timeout_ms: int, hard_timeout_s: float) -> subprocess
         "--immediate",
         "-o", str(out),
         "--timeout", str(timeout_ms),
-        "--width", "1536",
-        "--height", "864",
+        "--width", str(CAPTURE_WIDTH),
+        "--height", str(CAPTURE_HEIGHT),
     ]
     return subprocess.run(
         cmd,
@@ -139,36 +142,61 @@ def phash(img: Image.Image) -> str:
     return hashlib.md5(arr.tobytes()).hexdigest()[:16]
 
 
-def page_score(img: Image.Image) -> tuple[float, float]:
-    """Cheap 'does this look like a book cover/page?' metric.
+def page_score(img: Image.Image) -> dict:
+    """Compute multiple 'does this look like a book page/cover?' metrics.
 
-    Returns (laplacian_variance, mean_brightness). Rough calibration:
-      - blank wall / ceiling / dark desk: variance < 5, brightness <40 or noisy
-      - book cover with art + title: variance ~ 30..120
-      - open text page under the lamp: variance ~ 50..200+
+    Returns dict with: laplacian_var, mean, bright_frac, dark_frac.
 
-    We use Laplacian variance as a proxy for edge density (text/lines)."""
+    Calibration (128x128 grayscale):
+      - random desk / dark room:   mean~100, bright_frac<0.16, dark_frac>0.5
+      - book page under lamp:      mean>130, bright_frac>0.35, dark_frac<0.25
+      - book cover (may be dark):   bright_frac>0.20 typically
+      - blank white wall:          mean>200, bright_frac>0.7, laplacian_var<15
+    """
     gray = np.asarray(img.convert("L").resize((128, 128), Image.BILINEAR), dtype=np.float32)
     mean = float(gray.mean())
+    bright_frac = float((gray > 160).sum()) / gray.size
+    dark_frac = float((gray < 80).sum()) / gray.size
     c = gray[1:-1, 1:-1]
     up = gray[:-2, 1:-1]
     dn = gray[2:, 1:-1]
     lt = gray[1:-1, :-2]
     rt = gray[1:-1, 2:]
     lap = -4.0 * c + up + dn + lt + rt
-    return float(lap.var()), mean
+    return {
+        "laplacian_var": float(lap.var()),
+        "mean": mean,
+        "bright_frac": bright_frac,
+        "dark_frac": dark_frac,
+    }
 
 
 def is_likely_page(img: Image.Image) -> tuple[bool, str]:
-    """Return (ok, reason). Caller can log the reason at DEBUG level."""
-    var, mean = page_score(img)
+    """Multi-gate filter that rejects obviously non-book scenes.
+
+    Returns (ok, reason). Caller can log the reason at DEBUG level.
+
+    Gates:
+      1. Mean brightness in [PAGE_BRIGHTNESS_MIN, PAGE_BRIGHTNESS_MAX]
+      2. Bright-pixel fraction >= PAGE_BRIGHT_FRAC_MIN (paper detection)
+      3. Laplacian variance >= PAGE_SCORE_MIN (not a blank wall)
+    """
+    scores = page_score(img)
+    var = scores["laplacian_var"]
+    mean = scores["mean"]
+    bf = scores["bright_frac"]
+
+    tag = f"var={var:.0f} mean={mean:.0f} bright={bf:.0%}"
+
     if mean < PAGE_BRIGHTNESS_MIN:
-        return False, f"too dark (mean={mean:.1f})"
+        return False, f"too dark ({tag})"
     if mean > PAGE_BRIGHTNESS_MAX:
-        return False, f"too bright (mean={mean:.1f})"
+        return False, f"too bright ({tag})"
+    if bf < PAGE_BRIGHT_FRAC_MIN:
+        return False, f"no paper ({tag})"
     if var < PAGE_SCORE_MIN:
-        return False, f"low detail (var={var:.1f})"
-    return True, f"ok (var={var:.1f}, mean={mean:.1f})"
+        return False, f"too blank ({tag})"
+    return True, f"ok ({tag})"
 
 
 # ----- smoke test ----------------------------------------------------------
@@ -189,7 +217,9 @@ if __name__ == "__main__":
     print("phash B:", phash(b))
     print(f"similarity A vs B: {similarity(a, b):.4f}  (expect ~1.0 for same scene)")
     print(f"similarity A vs A: {similarity(a, a):.4f}  (expect 1.0)")
-    var_a, mean_a = page_score(a)
+    sc = page_score(a)
     ok_a, why_a = is_likely_page(a)
-    print(f"page_score A: var={var_a:.2f} mean={mean_a:.2f}  likely_page={ok_a} ({why_a})")
+    print(f"page_score A: var={sc['laplacian_var']:.1f} mean={sc['mean']:.1f}"
+          f" bright={sc['bright_frac']:.0%} dark={sc['dark_frac']:.0%}"
+          f"  likely_page={ok_a} ({why_a})")
     sys.exit(0)

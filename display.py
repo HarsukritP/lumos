@@ -71,14 +71,6 @@ def _blank() -> Image.Image:
     return Image.new("1", (OLED_WIDTH, OLED_HEIGHT), 0)
 
 
-def _flush(img: Image.Image) -> None:
-    _init_oled()
-    if _oled is None:
-        return
-    _oled.image(img)
-    _oled.show()
-
-
 def _text_width(draw: ImageDraw.ImageDraw, s: str, font) -> int:
     bbox = draw.textbbox((0, 0), s, font=font)
     return bbox[2] - bbox[0]
@@ -446,10 +438,30 @@ def show_ptt_footer(body: dict, footer_text: str) -> None:
         _flush(img)
 
 
+_last_frame: Image.Image | None = None
+
+
+def _flush(img: Image.Image) -> None:
+    """Push a 1-bit image to the OLED (if present) and stash for snapshots."""
+    global _last_frame
+    _last_frame = img.copy()
+    _init_oled()
+    if _oled is None:
+        return
+    _oled.image(img)
+    _oled.show()
+
+
 def snapshot_png() -> bytes:
-    """Return a PNG of the last-rendered frame (for debugging without hardware)."""
+    """Return a PNG of the last-rendered frame (for debugging without hardware).
+
+    Scales the 128x64 1-bit image to 512x256 so it's easily visible."""
+    frame = _last_frame or _blank()
+    scaled = frame.convert("L").resize(
+        (OLED_WIDTH * 4, OLED_HEIGHT * 4), Image.NEAREST
+    )
     buf = io.BytesIO()
-    _blank().save(buf, format="PNG")
+    scaled.save(buf, format="PNG")
     return buf.getvalue()
 
 
