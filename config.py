@@ -35,6 +35,17 @@ CAPTURE_INTERVAL = 2.0
 PAGE_STABILITY_TIME = 3.0
 SIMILARITY_THRESHOLD = 0.75
 
+# Local "does this frame look like a book page/cover?" gate. Runs before we
+# ever call Gemini, so pointing the camera at a ceiling / desk / shadow never
+# burns API quota. Tuned empirically on the rpicam-still output.
+PAGE_SCORE_MIN = 15.0         # Laplacian variance on a 128x128 grayscale
+PAGE_BRIGHTNESS_MIN = 40.0    # 0..255, reject very dark frames (mean)
+PAGE_BRIGHTNESS_MAX = 235.0   # reject blown-out white frames
+
+# If Gemini's book-identification confidence is below this, don't commit a
+# book row or summarize — we're probably looking at nothing/hands/noise.
+IDENTIFY_MIN_CONFIDENCE = 0.35
+
 IDLE_TIMEOUT = 20.0
 IDLE_CARD_SECONDS = 8.0
 QR_EVERY_SECONDS = 60.0

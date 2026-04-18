@@ -55,9 +55,23 @@ const routes = [
   { match: /^#?\/questions$/,           render: renderQuestions, tab: 'question' },
   { match: /^#?\/questions\/(\d+)$/,    render: (m) => renderQuestion(parseInt(m[1])), tab: 'question' },
   { match: /^#?\/vocab$/,               render: renderVocab, tab: 'vocab' },
+  { match: /^#?\/debug$/,               render: renderDebug, tab: null },
 ];
 
+// Intervals registered by a view; cleared on navigation.
+const _intervals = new Set();
+function onView(fn, ms) {
+  const id = setInterval(fn, ms);
+  _intervals.add(id);
+  return id;
+}
+function clearViewIntervals() {
+  for (const id of _intervals) clearInterval(id);
+  _intervals.clear();
+}
+
 function router() {
+  clearViewIntervals();
   const h = location.hash || '#/library';
   const root = document.getElementById('root');
   root.innerHTML = '';
@@ -67,11 +81,11 @@ function router() {
       Promise.resolve(r.render(m)).then((node) => {
         root.innerHTML = '';
         root.appendChild(node);
-        root.appendChild(renderNav(r.tab));
+        if (r.tab) root.appendChild(renderNav(r.tab));
       }).catch((err) => {
         root.innerHTML = '';
         root.appendChild(errorView(err));
-        root.appendChild(renderNav(r.tab));
+        if (r.tab) root.appendChild(renderNav(r.tab));
       });
       return;
     }
@@ -140,30 +154,58 @@ async function renderLibrary() {
   const list = el('div'); list.appendChild(skeletons(2));
   app.appendChild(list);
 
-  try {
-    const [books, st] = await Promise.all([api('/api/books'), api('/api/status').catch(() => null)]);
+  let lastCount = -1, lastTop = null, lastPhase = null;
 
-    if (st && st.book_title && st.book_title !== 'Unknown') {
-      status.innerHTML = '';
+  const paintStatus = (st) => {
+    status.innerHTML = '';
+    if (!st) {
+      status.append(el('span', { class: 'key' }, 'OFFLINE'), el('span', {}, 'device unreachable'));
+      return;
+    }
+    const phase = st.phase || 'connect';
+    if (phase !== lastPhase) lastPhase = phase;
+    if (phase === 'connect') {
+      status.append(el('span', { class: 'key' }, 'CONNECT'), el('span', {}, 'handshake received'));
+    } else if (phase === 'hunting') {
+      status.append(el('span', { class: 'key' }, 'HUNT'), el('span', {}, 'looking for a book\u2026'));
+    } else if (phase === 'reading' && st.book_title && st.book_title !== 'Unknown') {
       status.append(
         el('span', { class: 'key' }, 'NOW'),
-        el('span', {}, `${st.book_title} · p. ${st.current_page || '?'}`),
+        el('span', {}, st.book_title + ' \u00b7 p. ' + (st.current_page || '?')),
       );
     } else {
-      status.innerHTML = '';
       status.append(el('span', { class: 'key' }, 'READY'), el('span', {}, 'open a book under the lamp'));
     }
+  };
 
+  const paintBooks = (books) => {
+    const topId = books[0]?.id ?? null;
+    if (books.length === lastCount && topId === lastTop) return;
+    lastCount = books.length; lastTop = topId;
     list.innerHTML = '';
     if (!books.length) {
       list.appendChild(el('div', { class: 'empty' }, 'No books yet. Point Lumos at a book to begin.'));
     } else {
       for (const b of books) list.appendChild(bookCard(b));
     }
-  } catch (e) {
-    list.innerHTML = '';
-    list.appendChild(el('div', { class: 'empty' }, 'Device offline. Try again in a moment.'));
-  }
+  };
+
+  const refreshStatus = async () => {
+    try { paintStatus(await api('/api/status')); } catch { paintStatus(null); }
+  };
+  const refreshBooks = async () => {
+    try { paintBooks(await api('/api/books')); }
+    catch {
+      if (lastCount <= 0) {
+        list.innerHTML = '';
+        list.appendChild(el('div', { class: 'empty' }, 'Device offline. Try again in a moment.'));
+      }
+    }
+  };
+
+  await Promise.all([refreshStatus(), refreshBooks()]);
+  onView(refreshStatus, 2000);
+  onView(refreshBooks, 4000);
   return app;
 }
 
@@ -367,5 +409,85 @@ async function renderVocab() {
     list.innerHTML = '';
     list.appendChild(el('div', { class: 'empty' }, 'Device offline.'));
   }
+  return app;
+}
+
+// --- DEBUG -------------------------------------------------------------
+async function renderDebug() {
+  const app = el('div', { class: 'app debug-view' });
+
+  const back = el('a', { href: '#/library', class: 'back' });
+  back.appendChild(icon('arrow'));
+  back.appendChild(el('span', {}, 'library'));
+  app.appendChild(back);
+
+  app.appendChild(el('div', { class: 'hero' },
+    el('h1', {}, 'Debug'),
+    el('div', { class: 'sub' }, 'Live camera + detector score. Aim the lamp.'),
+  ));
+
+  const frame = el('img', { class: 'debug-frame', alt: 'latest frame' });
+  frame.src = '/api/debug/frame?t=' + Date.now();
+  frame.onerror = () => { frame.style.display = 'none'; };
+  app.appendChild(frame);
+
+  const grid = el('div', { class: 'debug-grid' });
+  app.appendChild(grid);
+
+  const mk = (label) => {
+    const row = el('div', { class: 'debug-row' });
+    const v = el('span', { class: 'debug-value mono' }, '\u2026');
+    row.append(el('span', { class: 'debug-label' }, label), v);
+    grid.appendChild(row);
+    return v;
+  };
+  const vPhase = mk('phase');
+  const vBook = mk('book');
+  const vPage = mk('page');
+  const vOk = mk('likely-page');
+  const vReason = mk('reason');
+  const vVar = mk('variance');
+  const vMean = mk('brightness');
+  const vCaptured = mk('captured');
+  const vCommitted = mk('last commit');
+
+  const audioWrap = el('div', { class: 'debug-audio' });
+  audioWrap.appendChild(el('h3', {}, 'last question audio'));
+  const aud = el('audio', { controls: 'controls', preload: 'none' });
+  aud.src = '/api/debug/audio?t=' + Date.now();
+  audioWrap.appendChild(aud);
+  app.appendChild(audioWrap);
+
+  const fmtTs = (ts) => {
+    if (!ts) return '\u2014';
+    const d = (Date.now() / 1000) - ts;
+    if (d < 2) return 'just now';
+    if (d < 60) return Math.floor(d) + 's ago';
+    if (d < 3600) return Math.floor(d / 60) + 'm ago';
+    return Math.floor(d / 3600) + 'h ago';
+  };
+
+  const refresh = async () => {
+    try {
+      frame.style.display = '';
+      frame.src = '/api/debug/frame?t=' + Date.now();
+      const s = await api('/api/debug/state');
+      vPhase.textContent = s.phase || '\u2014';
+      vBook.textContent = (s.book_title && s.book_title !== 'Unknown') ? s.book_title : '\u2014';
+      vPage.textContent = s.current_page ? 'p. ' + s.current_page : '\u2014';
+      vOk.textContent = s.last_capture_ok ? 'yes' : 'no';
+      vOk.className = 'debug-value mono ' + (s.last_capture_ok ? 'ok' : 'bad');
+      vReason.textContent = s.last_capture_reason || '\u2014';
+      vVar.textContent = (s.last_capture_var ?? 0).toFixed(1);
+      vMean.textContent = (s.last_capture_mean ?? 0).toFixed(1);
+      vCaptured.textContent = fmtTs(s.last_capture_at);
+      vCommitted.textContent = fmtTs(s.last_commit_at);
+    } catch (e) {
+      vPhase.textContent = 'offline';
+    }
+  };
+
+  await refresh();
+  onView(refresh, 1500);
   return app;
 }

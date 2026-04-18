@@ -30,6 +30,7 @@ def _load_font(path: Path, size: int) -> ImageFont.ImageFont:
 FONT_SM = _load_font(_FONT_REGULAR_PATH, 10)
 FONT_MD = _load_font(_FONT_BOLD_PATH, 12)
 FONT_LG = _load_font(_FONT_BOLD_PATH, 16)
+FONT_XL = _load_font(_FONT_BOLD_PATH, 34)
 FONT_MONO = _load_font(_FONT_MONO_PATH, 10)
 
 
@@ -158,6 +159,37 @@ def show_ready(book_title: str | None, current_page: int | None) -> None:
         )
     else:
         show_status("Lumos", ["ready", "open a book"])
+
+
+def show_caught_up(page_number: int | None, book_title: str | None = None) -> None:
+    """Primary reading-phase idle display: book title (tiny), giant page
+    number, 'caught up' footer. This is the main trust signal — if the number
+    shown here matches the page the user is actually on, Lumos is in sync."""
+    img = _blank()
+    draw = ImageDraw.Draw(img)
+
+    if book_title and book_title != "Unknown":
+        title = book_title
+        # Hand-truncate so the top row is always ~1 line.
+        max_chars = 20
+        if len(title) > max_chars:
+            title = title[: max_chars - 1] + "\u2026"
+        draw.text((2, 0), title, font=FONT_SM, fill=255)
+
+    page_str = f"p. {page_number}" if page_number else "p. ?"
+    tw = _text_width(draw, page_str, FONT_XL)
+    x = max(2, (OLED_WIDTH - tw) // 2)
+    # Center vertically in the middle band.
+    draw.text((x, 12), page_str, font=FONT_XL, fill=255)
+
+    # Footer
+    footer = "caught up"
+    fw = _text_width(draw, footer, FONT_SM)
+    draw.text(((OLED_WIDTH - fw) // 2, OLED_HEIGHT - FONT_SM.size - 2),
+              footer, font=FONT_SM, fill=255)
+
+    with _lock:
+        _flush(img)
 
 
 def show_page_summary(page_number: int, summary: str) -> None:

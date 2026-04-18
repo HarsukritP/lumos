@@ -11,7 +11,7 @@ import sys
 import threading
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, send_from_directory
+from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 # Make sibling modules importable when Flask is started from the package
@@ -20,7 +20,7 @@ if str(_PARENT) not in sys.path:
     sys.path.insert(0, str(_PARENT))
 
 import db
-from config import FLASK_HOST, FLASK_PORT, STATIC_DIR
+from config import FLASK_HOST, FLASK_PORT, FRAME_PATH, QUESTION_WAV, STATIC_DIR
 
 log = logging.getLogger("lumos.server")
 
@@ -28,13 +28,22 @@ app = Flask(__name__, static_folder=None)
 CORS(app)
 
 
+@app.before_request
+def _note_client():
+    # First non-loopback hit on any endpoint advances the phase out of connect.
+    try:
+        from state import note_remote_client
+        note_remote_client(request.remote_addr)
+    except Exception:
+        pass
+
+
 # ----- API -----------------------------------------------------------------
 
 @app.get("/api/status")
 def api_status():
-    # Lazily import to avoid circular import at module load time
     try:
-        from main import STATE
+        from state import STATE
         return jsonify(STATE.to_status())
     except Exception as e:
         log.warning("status lookup failed: %r", e)
@@ -86,6 +95,47 @@ def api_question(qid: int):
 @app.get("/api/vocab")
 def api_vocab():
     return jsonify(db.all_vocab())
+
+
+# ----- debug surface -------------------------------------------------------
+
+@app.get("/api/debug/state")
+def api_debug_state():
+    try:
+        from state import STATE
+        return jsonify(STATE.to_debug())
+    except Exception as e:
+        log.warning("debug state lookup failed: %r", e)
+        return jsonify({"error": "state unavailable"}), 503
+
+
+@app.get("/api/debug/frame")
+def api_debug_frame():
+    """Latest camera frame (jpeg). Overwritten by the watch loop on each
+    capture; clients should bust the cache with a cache-busting query param."""
+    p = Path(FRAME_PATH)
+    if not p.exists():
+        abort(404)
+    resp = send_file(
+        str(p),
+        mimetype="image/jpeg",
+        max_age=0,
+        last_modified=p.stat().st_mtime,
+    )
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.get("/api/debug/audio")
+def api_debug_audio():
+    """Latest recorded question (wav). Missing until the button has been
+    pressed at least once in this boot."""
+    p = Path(QUESTION_WAV)
+    if not p.exists():
+        abort(404)
+    resp = send_file(str(p), mimetype="audio/wav", max_age=0)
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 # ----- PWA static + SPA fallback ------------------------------------------

@@ -31,6 +31,7 @@ from config import (
     BUTTON_PIN,
     CAPTURE_INTERVAL,
     FRAME_PATH,
+    IDENTIFY_MIN_CONFIDENCE,
     IDLE_CARD_SECONDS,
     IDLE_TIMEOUT,
     LIBRARY_URL,
@@ -45,50 +46,23 @@ from config import (
 
 log = logging.getLogger("lumos.main")
 
+# STATE is deliberately imported from a dedicated module so the Flask server
+# (which `from main import ...` via its own import of `main`) shares the
+# exact same instance as this orchestrator. Running `python3 main.py` makes
+# this file `__main__`, which Flask would otherwise re-import as `main`,
+# creating a second State(). The state module dodges that.
+from state import (
+    PHASE_CONNECT,
+    PHASE_HUNTING,
+    PHASE_READING,
+    STATE,
+    note_remote_client,  # noqa: F401  (re-exported for app/server.py)
+)
 
-# ----- shared state --------------------------------------------------------
-
-class State:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        # book identity
-        self.book_id: int | None = None
-        self.book_title: str = "Unknown"
-        self.book_author: str = "Unknown"
-        self.current_page: int = 0
-        # frame comparison
-        self.last_committed: Image.Image | None = None
-        self.pending_frame: Image.Image | None = None
-        self.pending_path: Path | None = None
-        self.pending_since: float | None = None
-        # activity / busy
-        self.last_activity: float = time.time()
-        self.busy: bool = False
-        # idle card rotation
-        self.idle_cards: list[dict[str, Any]] = []
-        self.current_card_index: int = 0
-        self.last_card_at: float = 0.0
-        self.last_qr_at: float = 0.0
-        # boot/run metadata
-        self.started_at: float = time.time()
-        self.shutdown: bool = False
-
-    def touch(self) -> None:
-        self.last_activity = time.time()
-
-    def to_status(self) -> dict:
-        return {
-            "book_id": self.book_id,
-            "book_title": self.book_title,
-            "book_author": self.book_author,
-            "current_page": self.current_page,
-            "busy": self.busy,
-            "started_at": self.started_at,
-            "uptime_s": time.time() - self.started_at,
-        }
-
-
-STATE = State()
+# How long to wait in connect with no remote client before auto-advancing
+# (so the device is still demo-able without a phone, and so localhost-only
+# testing isn't blocked).
+CONNECT_AUTO_ADVANCE_S = 90.0
 
 
 # ----- idle card helpers ---------------------------------------------------
@@ -142,7 +116,23 @@ def _commit_page(img: Image.Image, img_path: Path) -> None:
             title = ident["title"]
             author = ident["author"]
             is_textbook = ident["is_textbook"]
-            log.info("identified: %r by %r (tb=%s, conf=%.2f)", title, author, is_textbook, ident["confidence"])
+            conf = ident["confidence"]
+            log.info(
+                "identified: %r by %r (tb=%s, conf=%.2f)",
+                title, author, is_textbook, conf,
+            )
+            if (
+                conf < IDENTIFY_MIN_CONFIDENCE
+                or (title.strip().lower() == "unknown" and author.strip().lower() == "unknown")
+            ):
+                log.info("identification rejected (conf<%.2f or unknown); not committing",
+                         IDENTIFY_MIN_CONFIDENCE)
+                # Drop last_committed so the next real page still gets a chance.
+                with STATE.lock:
+                    STATE.last_committed = None
+                # Idle loop (phase=hunting) will restore the "looking for a
+                # book..." card; we don't need to touch the display here.
+                return
             phash = camera.phash(img)
             row = db.get_or_create_book(phash)
             db.update_book_identity(row["id"], title, author, is_textbook)
@@ -150,6 +140,7 @@ def _commit_page(img: Image.Image, img_path: Path) -> None:
                 STATE.book_id = row["id"]
                 STATE.book_title = title
                 STATE.book_author = author
+            STATE.set_phase(PHASE_READING, reason=f"identified {title!r}")
 
         display.show_status("Lumos", ["reading", "the page..."])
         summary = ai.summarize_page(img_path, STATE.book_title, STATE.current_page)
@@ -166,6 +157,7 @@ def _commit_page(img: Image.Image, img_path: Path) -> None:
 
         with STATE.lock:
             STATE.current_page = page_number
+            STATE.last_commit_at = time.time()
 
         for v in summary["vocabulary"]:
             if isinstance(v, dict) and v.get("word") and v.get("definition"):
@@ -194,6 +186,34 @@ def watch_loop() -> None:
                 continue
             path = camera.capture(FRAME_PATH)
             img = camera.load_oriented(path)
+            var, mean = camera.page_score(img)
+            ok, reason = camera.is_likely_page(img)
+            with STATE.lock:
+                STATE.last_capture_at = time.time()
+                STATE.last_capture_var = var
+                STATE.last_capture_mean = mean
+                STATE.last_capture_ok = ok
+                STATE.last_capture_reason = reason
+
+            # In connect phase, we still capture (so the debug view is live),
+            # but we don't try to commit / identify anything.
+            if STATE.phase == PHASE_CONNECT:
+                dt = time.monotonic() - t0
+                time.sleep(max(0.0, CAPTURE_INTERVAL - dt))
+                continue
+
+            if not ok:
+                # Not book-like; don't let it become pending, don't call Gemini.
+                log.debug("skipping frame: %s", reason)
+                # If we had a pending candidate waiting to stabilize, drop it.
+                if STATE.pending_frame is not None:
+                    with STATE.lock:
+                        STATE.pending_frame = None
+                        STATE.pending_path = None
+                        STATE.pending_since = None
+                dt = time.monotonic() - t0
+                time.sleep(max(0.0, CAPTURE_INTERVAL - dt))
+                continue
 
             if STATE.last_committed is None and STATE.pending_frame is None:
                 # first frame ever: treat it as the start of a pending commit
@@ -250,33 +270,90 @@ def watch_loop() -> None:
 
 # ----- idle loop -----------------------------------------------------------
 
+# How long after the last commit we stay on the "page summary" display before
+# flipping to the caught-up card. Keeps the summary readable for a moment.
+CAUGHT_UP_AFTER_COMMIT_S = 8.0
+
+# Interval between re-flushing the same welcome/hunting screen so the OLED
+# doesn't drift into burn-in on a single static frame during long demos.
+STATIC_REFRESH_S = 20.0
+
+
 def idle_loop() -> None:
+    """Drives the OLED while the watch loop isn't actively committing.
+
+    Phase drives the primary display:
+      connect  -> persistent welcome QR ("scan me")
+      hunting  -> "looking for a book" card
+      reading  -> big "p. N  ·  caught up" card, occasionally rotating to a
+                  queued vocab/character card for ~8s then returning.
+    """
     log.info("idle loop starting")
+    last_static_flush = 0.0
+    last_rotation_at = 0.0
+    rotation_showing_card = False
+
     while not STATE.shutdown:
         try:
             now = time.time()
-            idle_for = now - STATE.last_activity
-            if idle_for < IDLE_TIMEOUT or STATE.busy:
+
+            # Demo-friendly fallback: if nobody scanned the QR after a while,
+            # advance anyway so local / on-device testing can proceed.
+            if (
+                STATE.phase == PHASE_CONNECT
+                and now - STATE.started_at >= CONNECT_AUTO_ADVANCE_S
+            ):
+                STATE.set_phase(PHASE_HUNTING, reason="connect auto-advance")
+
+            # Don't fight the watch loop / question handler for the OLED.
+            if STATE.busy:
+                time.sleep(0.5)
+                continue
+
+            if STATE.phase == PHASE_CONNECT:
+                if now - last_static_flush >= STATIC_REFRESH_S or last_static_flush == 0.0:
+                    display.show_qr(LIBRARY_URL, caption="scan to")
+                    last_static_flush = now
+                    STATE.last_qr_at = now
                 time.sleep(1.0)
                 continue
 
-            # Build rotation: queued cards + periodic QR + status fallback
+            if STATE.phase == PHASE_HUNTING:
+                if now - last_static_flush >= STATIC_REFRESH_S or last_static_flush == 0.0:
+                    display.show_status("Lumos", ["looking for", "a book..."])
+                    last_static_flush = now
+                time.sleep(1.0)
+                continue
+
+            # PHASE_READING
+            since_commit = now - (STATE.last_commit_at or 0)
+            if since_commit < CAUGHT_UP_AFTER_COMMIT_S:
+                # Commit just happened; let show_page_summary linger.
+                time.sleep(0.5)
+                continue
+
+            # Primary display: big page number, "caught up" footer.
+            # Every IDLE_CARD_SECONDS, rotate to a vocab/character card for
+            # one beat then return to caught_up. If no queue, stay on caught_up.
             with STATE.lock:
                 cards = list(STATE.idle_cards)
-            if not cards:
-                cards = [{"type": "status"}]
 
-            # Inject QR card if we haven't shown one recently
-            if now - STATE.last_qr_at > QR_EVERY_SECONDS:
-                cards = cards + [{"type": "qr"}]
-                STATE.last_qr_at = now
-
-            if now - STATE.last_card_at >= IDLE_CARD_SECONDS:
+            if cards and now - last_rotation_at >= IDLE_CARD_SECONDS:
                 idx = STATE.current_card_index % len(cards)
                 render_idle_card(cards[idx])
                 STATE.current_card_index = (idx + 1) % len(cards)
-                STATE.last_card_at = now
+                last_rotation_at = now
+                rotation_showing_card = True
+                last_static_flush = 0.0
+                time.sleep(IDLE_CARD_SECONDS)
+                continue
 
+            # Re-flush caught_up periodically so we recover from any transient
+            # I2C glitch or screen drift.
+            if rotation_showing_card or now - last_static_flush >= STATIC_REFRESH_S:
+                display.show_caught_up(STATE.current_page, STATE.book_title)
+                last_static_flush = now
+                rotation_showing_card = False
             time.sleep(1.0)
         except Exception as e:
             log.exception("idle loop error: %r", e)
@@ -410,8 +487,9 @@ def main() -> None:
     threading.Thread(target=watch_loop, daemon=True, name="watch").start()
     threading.Thread(target=idle_loop, daemon=True, name="idle").start()
 
-    display.show_ready(None, None)
-    log.info("Lumos ready. Ctrl-C to stop.")
+    # connect phase: show welcome QR immediately. Idle loop keeps it refreshed.
+    display.show_qr(LIBRARY_URL, caption="scan to")
+    log.info("Lumos ready (phase=%s). Ctrl-C to stop.", STATE.phase)
     try:
         while not STATE.shutdown:
             time.sleep(1.0)

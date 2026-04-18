@@ -357,6 +357,59 @@ nav.tabs a svg { width: 22px; height: 22px; }
 }
 .back:hover { color: var(--amber); }
 
+/* ---- debug view ---- */
+.debug-view .debug-frame {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: #000;
+  border: 1px solid var(--amber-border);
+  border-radius: var(--radius);
+  margin-bottom: 14px;
+}
+.debug-grid {
+  background: var(--surface);
+  border: 1px solid var(--amber-border);
+  border-radius: var(--radius);
+  padding: 4px 12px;
+  margin-bottom: 14px;
+}
+.debug-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  font-size: 13px;
+}
+.debug-row:last-child { border-bottom: 0; }
+.debug-label {
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.debug-value { color: var(--text); }
+.debug-value.ok { color: var(--success); }
+.debug-value.bad { color: var(--warn); }
+.debug-audio {
+  background: var(--surface);
+  border: 1px solid var(--amber-border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.debug-audio h3 {
+  margin: 0 0 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.debug-audio audio { width: 100%; }
+
 /* ---- scanline overlay on library hero only (optional polish) ---- */
 .hero.scanlines::after {
   content: '';

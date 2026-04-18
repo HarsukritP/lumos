@@ -17,6 +17,9 @@ from config import (
     CAMERA_ROTATION,
     CAMERA_TIMEOUT_MS,
     FRAME_PATH,
+    PAGE_BRIGHTNESS_MAX,
+    PAGE_BRIGHTNESS_MIN,
+    PAGE_SCORE_MIN,
     PENDING_PATH,
     TMP_DIR,
 )
@@ -87,6 +90,38 @@ def phash(img: Image.Image) -> str:
     return hashlib.md5(arr.tobytes()).hexdigest()[:16]
 
 
+def page_score(img: Image.Image) -> tuple[float, float]:
+    """Cheap 'does this look like a book cover/page?' metric.
+
+    Returns (laplacian_variance, mean_brightness). Rough calibration:
+      - blank wall / ceiling / dark desk: variance < 5, brightness <40 or noisy
+      - book cover with art + title: variance ~ 30..120
+      - open text page under the lamp: variance ~ 50..200+
+
+    We use Laplacian variance as a proxy for edge density (text/lines)."""
+    gray = np.asarray(img.convert("L").resize((128, 128), Image.BILINEAR), dtype=np.float32)
+    mean = float(gray.mean())
+    c = gray[1:-1, 1:-1]
+    up = gray[:-2, 1:-1]
+    dn = gray[2:, 1:-1]
+    lt = gray[1:-1, :-2]
+    rt = gray[1:-1, 2:]
+    lap = -4.0 * c + up + dn + lt + rt
+    return float(lap.var()), mean
+
+
+def is_likely_page(img: Image.Image) -> tuple[bool, str]:
+    """Return (ok, reason). Caller can log the reason at DEBUG level."""
+    var, mean = page_score(img)
+    if mean < PAGE_BRIGHTNESS_MIN:
+        return False, f"too dark (mean={mean:.1f})"
+    if mean > PAGE_BRIGHTNESS_MAX:
+        return False, f"too bright (mean={mean:.1f})"
+    if var < PAGE_SCORE_MIN:
+        return False, f"low detail (var={var:.1f})"
+    return True, f"ok (var={var:.1f}, mean={mean:.1f})"
+
+
 # ----- smoke test ----------------------------------------------------------
 
 if __name__ == "__main__":
@@ -105,4 +140,7 @@ if __name__ == "__main__":
     print("phash B:", phash(b))
     print(f"similarity A vs B: {similarity(a, b):.4f}  (expect ~1.0 for same scene)")
     print(f"similarity A vs A: {similarity(a, a):.4f}  (expect 1.0)")
+    var_a, mean_a = page_score(a)
+    ok_a, why_a = is_likely_page(a)
+    print(f"page_score A: var={var_a:.2f} mean={mean_a:.2f}  likely_page={ok_a} ({why_a})")
     sys.exit(0)
