@@ -34,6 +34,11 @@ OLED_I2C_ADDR = 0x3C
 CAPTURE_INTERVAL = 2.0
 PAGE_STABILITY_TIME = 3.0
 SIMILARITY_THRESHOLD = 0.75
+# Post-stability dedup: if a candidate commit's similarity to last_committed
+# is at or above this, treat it as the same page and DO NOT call Gemini to
+# summarize it again. Empirically a real page turn drops sim well below 0.75;
+# 0.88 keeps us safe against lighting drift / minor hand shadows.
+DEDUP_SIMILARITY = 0.88
 
 # Local "does this frame look like a book page/cover?" gate. Runs before we
 # ever call Gemini, so pointing the camera at a ceiling / desk / shadow never
@@ -58,6 +63,24 @@ IDENTIFY_MIN_COVER_CONFIDENCE = 0.55  # higher bar for cover-only IDs
 # lower than SIMILARITY_THRESHOLD (0.75) so normal page turns don't trigger.
 BOOK_SWITCH_SIMILARITY = 0.35
 BOOK_SWITCH_HOLD_S = 4.0
+
+# "Resume from last page" prompt timeout. If the reader hasn't flipped to
+# (or past) their last-known page within this many seconds after a re-
+# identify, auto-dismiss the prompt and start summarizing from whatever
+# page we're currently looking at.
+RESUME_TIMEOUT_S = 90.0
+
+# Walkie-talkie push-to-talk. Hold-to-record; release = stop + process.
+# If the user holds past this, we auto-stop so arecord doesn't run forever.
+PTT_MAX_SECONDS = 10
+# Minimum hold needed before we consider it a real recording (protects
+# against stray short presses getting transcribed as noise).
+PTT_MIN_SECONDS = 0.4
+# Long-press threshold used INSIDE the resume prompt to "skip resume".
+# Unrelated to PTT: if the reader holds the button >= this while
+# awaiting_resume, we drop the prompt and accept the current frame as the
+# starting page.
+RESUME_SKIP_HOLD_S = 2.0
 
 IDLE_TIMEOUT = 20.0
 IDLE_CARD_SECONDS = 8.0

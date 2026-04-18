@@ -27,11 +27,13 @@ import audio
 import camera
 import db
 import display
+import ocr
 from config import (
     BOOK_SWITCH_HOLD_S,
     BOOK_SWITCH_SIMILARITY,
     BUTTON_PIN,
     CAPTURE_INTERVAL,
+    DEDUP_SIMILARITY,
     FRAME_PATH,
     IDENTIFY_CONFIRMATIONS,
     IDENTIFY_MIN_CONFIDENCE,
@@ -41,9 +43,12 @@ from config import (
     LIBRARY_URL,
     PAGE_STABILITY_TIME,
     PENDING_PATH,
+    PTT_MAX_SECONDS,
+    PTT_MIN_SECONDS,
     QR_EVERY_SECONDS,
-    QUESTION_RECORD_SECONDS,
     QUESTION_WAV,
+    RESUME_SKIP_HOLD_S,
+    RESUME_TIMEOUT_S,
     SIMILARITY_THRESHOLD,
     has_api_key,
 )
@@ -185,21 +190,45 @@ def _try_identify_book(img: Image.Image, img_path: Path) -> bool:
     row = db.find_or_create_book_by_identity(
         title, author, is_textbook, cover_phash=camera.phash(img),
     )
+    prev_page = int(row.get("current_page") or 0)
     with STATE.lock:
         STATE.book_id = row["id"]
         STATE.book_title = row["title"]
         STATE.book_author = row["author"]
-        STATE.current_page = int(row.get("current_page") or 0)
+        STATE.current_page = prev_page
         STATE.current_title_key = tk
         STATE.current_author_key = ak
         STATE.oled_title = oled_title
-    STATE.set_phase(PHASE_READING, reason=f"identified {row['title']!r} ({count}/{IDENTIFY_CONFIRMATIONS})")
+        # If we've read this book before, go into the resume prompt so
+        # we don't accidentally summarize the cover page as page 1.
+        if prev_page > 0:
+            STATE.awaiting_resume = True
+            STATE.resume_target_page = prev_page
+            STATE.awaiting_resume_since = time.time()
+        else:
+            STATE.awaiting_resume = False
+            STATE.resume_target_page = 0
+            STATE.awaiting_resume_since = 0.0
+    STATE.set_phase(
+        PHASE_READING,
+        reason=f"identified {row['title']!r} ({count}/{IDENTIFY_CONFIRMATIONS})"
+              + (f", resume p.{prev_page}" if prev_page else ", fresh"),
+    )
     return True
 
 
 def _clip(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[: n - 1] + "\u2026"
+
+
+def _safe_ocr_page(img: Image.Image) -> int | None:
+    """Wrap ocr.read_page_number so a Tesseract hiccup never kills watch_loop."""
+    try:
+        return ocr.read_page_number(img)
+    except Exception as e:
+        log.debug("ocr page-number failed: %r", e)
+        return None
 
 
 def _commit_page_read(img: Image.Image, img_path: Path) -> None:
@@ -327,6 +356,21 @@ def watch_loop() -> None:
                 time.sleep(max(0.0, CAPTURE_INTERVAL - dt))
                 continue
 
+            # Resume prompt auto-dismiss on timeout. If the reader never flips
+            # to their last page within RESUME_TIMEOUT_S, drop the prompt and
+            # let the next stable frame commit as a fresh page.
+            if (
+                STATE.awaiting_resume
+                and STATE.awaiting_resume_since
+                and time.time() - STATE.awaiting_resume_since >= RESUME_TIMEOUT_S
+            ):
+                log.info(
+                    "resume prompt auto-dismissed (%.0fs elapsed)",
+                    time.time() - STATE.awaiting_resume_since,
+                )
+                with STATE.lock:
+                    STATE.awaiting_resume = False
+
             if not ok:
                 # Not book-like; don't let it become pending, don't call Gemini.
                 log.debug("skipping frame: %s", reason)
@@ -383,19 +427,86 @@ def watch_loop() -> None:
                         try:
                             if STATE.book_id is None:
                                 # Strict scan flow: require N-in-a-row agreeing
-                                # identifies before committing a book. On the
-                                # commit call itself we also summarize this page.
+                                # identifies before committing a book. Once
+                                # we've committed, only summarize this frame
+                                # if we're NOT entering the resume-prompt
+                                # state (which we enter when the book was
+                                # previously read past page 0).
                                 committed_ok = _try_identify_book(
                                     committed, committed_path or Path(path)
                                 )
-                                if committed_ok:
+                                if committed_ok and not STATE.awaiting_resume:
                                     _commit_page_read(
                                         committed, committed_path or Path(path)
                                     )
+                            elif STATE.awaiting_resume:
+                                # Book is identified and we're waiting for
+                                # the reader to flip to their last-known page.
+                                # OCR the committed frame; only exit resume
+                                # when the printed page number is >= the
+                                # resume target (they've caught up, or gone
+                                # past it). Otherwise stay waiting; don't
+                                # call Gemini.
+                                pn_local = _safe_ocr_page(committed)
+                                with STATE.lock:
+                                    STATE.last_detected_page = pn_local
+                                target = STATE.resume_target_page
+                                if pn_local is not None and pn_local >= target:
+                                    log.info(
+                                        "resume satisfied: on p.%d (target p.%d)",
+                                        pn_local, target,
+                                    )
+                                    with STATE.lock:
+                                        STATE.awaiting_resume = False
+                                        STATE.current_page = pn_local
+                                    _commit_page_read(
+                                        committed, committed_path or Path(path)
+                                    )
+                                else:
+                                    log.info(
+                                        "still awaiting resume (ocr=%r, target=p.%d)",
+                                        pn_local, target,
+                                    )
                             else:
-                                _commit_page_read(
-                                    committed, committed_path or Path(path)
-                                )
+                                # Dedup guards — both avoid a Gemini call on
+                                # the common "same page as before" case.
+                                #
+                                # Layer 1 (pixel): near-identical NCC
+                                # similarity to last_committed. Catches
+                                # jitter/lighting re-stabilizations.
+                                #
+                                # Layer 2 (OCR): if pixel sim dropped enough
+                                # to look like a new page but local OCR
+                                # reports the same printed page number as
+                                # STATE.current_page, that's the same
+                                # spread under the lamp — skip Gemini.
+                                if STATE.last_committed is not None and \
+                                    camera.similarity(
+                                        committed, STATE.last_committed
+                                    ) >= DEDUP_SIMILARITY:
+                                    log.info("skip commit: pixel-dedup hit")
+                                    with STATE.lock:
+                                        STATE.last_committed = committed
+                                else:
+                                    pn_local = _safe_ocr_page(committed)
+                                    with STATE.lock:
+                                        STATE.last_detected_page = pn_local
+                                    if (
+                                        pn_local is not None
+                                        and STATE.current_page
+                                        and pn_local == STATE.current_page
+                                    ):
+                                        log.info(
+                                            "skip commit: OCR-dedup hit "
+                                            "(printed p.%d == current p.%d)",
+                                            pn_local, STATE.current_page,
+                                        )
+                                        with STATE.lock:
+                                            STATE.last_committed = committed
+                                    else:
+                                        _commit_page_read(
+                                            committed, committed_path or Path(path)
+                                        )
                         finally:
                             with STATE.lock:
                                 STATE.busy = False
@@ -480,6 +591,19 @@ def idle_loop() -> None:
                 continue
 
             # PHASE_READING
+            # Resume prompt takes priority: we've identified a book we've
+            # seen before and are waiting for the reader to flip to their
+            # last-known page before we start summarizing again.
+            if STATE.awaiting_resume:
+                if now - last_static_flush >= STATIC_REFRESH_S or last_static_flush == 0.0:
+                    display.show_resume_prompt(
+                        STATE.oled_title or STATE.book_title,
+                        STATE.resume_target_page,
+                    )
+                    last_static_flush = now
+                time.sleep(1.0)
+                continue
+
             since_commit = now - (STATE.last_commit_at or 0)
             if since_commit < CAUGHT_UP_AFTER_COMMIT_S:
                 # Commit just happened; let show_page_summary linger.
@@ -514,47 +638,213 @@ def idle_loop() -> None:
             time.sleep(1.0)
 
 
-# ----- button / question flow ---------------------------------------------
+# ----- button / push-to-talk flow -----------------------------------------
 
-def handle_question() -> None:
-    """Full button-press flow: record -> transcribe -> answer -> render."""
-    if STATE.busy:
-        display.show_status("Lumos", ["busy...", "one moment"])
-        return
+# Guards + slots for the walkie-talkie state machine. gpiozero fires the
+# when_pressed / when_released callbacks on its own thread, so we hold a
+# lock around transitions; the actual transcribe/answer work runs on its
+# own thread so the release callback returns fast.
+_ptt_lock = threading.Lock()
+# Live PTT recorder (None when the button is not held for PTT).
+_ptt_rec: audio.PTTRecorder | None = None
+_ptt_press_at: float = 0.0
+# True if this press was accepted as a "resume-skip" gesture rather than a
+# real PTT recording. We hold the resume prompt during the press, then if
+# the release came after RESUME_SKIP_HOLD_S we clear awaiting_resume.
+_ptt_resume_skip_mode: bool = False
+# Background thread that drives the live "rec 00:02" footer on the OLED.
+_ptt_footer_stop: threading.Event | None = None
+
+
+def _ptt_footer_ticker() -> None:
+    """Runs while _ptt_rec is active; redraws the OLED footer with elapsed
+    seconds until stopped by _ptt_footer_stop."""
+    stop = _ptt_footer_stop
+    while stop is not None and not stop.is_set():
+        rec = _ptt_rec
+        if rec is None:
+            break
+        elapsed = rec.elapsed()
+        display.show_ptt_footer(
+            _ptt_body_context(),
+            f"\u25cf rec {elapsed:04.1f}s",
+        )
+        if stop.wait(0.5):
+            break
+
+
+def _ptt_body_context() -> dict:
+    """Snapshot of whatever the idle display would otherwise render right
+    now, so the PTT footer overlay preserves the in-view content."""
+    # Prefer a queued vocab/character card if we have one (feels more
+    # informative), else fall back to the page-number "caught up" view.
     with STATE.lock:
-        STATE.busy = True
-    STATE.touch()
-    try:
-        display.show_status("Lumos", [f"listening... ({QUESTION_RECORD_SECONDS}s)"])
-        try:
-            wav = audio.record(QUESTION_RECORD_SECONDS, QUESTION_WAV)
-        except audio.AudioError as e:
-            log.warning("audio record failed: %r", e)
-            display.show_status("Lumos", ["mic error", "try again"])
+        cards = list(STATE.idle_cards)
+        page = STATE.current_page
+        title = STATE.oled_title or STATE.book_title
+        idx = STATE.current_card_index
+    if cards:
+        card = cards[idx % len(cards)]
+        return {"type": "card", "card": card}
+    return {"type": "caught_up", "page": page, "title": title}
+
+
+def _on_button_down() -> None:
+    """Button was pressed. Kick off either a resume-skip hold or a PTT
+    recording, depending on current state."""
+    global _ptt_rec, _ptt_press_at, _ptt_resume_skip_mode, _ptt_footer_stop
+    with _ptt_lock:
+        if _ptt_rec is not None or _ptt_resume_skip_mode:
+            return  # already handling a press
+        _ptt_press_at = time.monotonic()
+
+        # Scenario 1: resume prompt is up. Any press starts a resume-skip
+        # candidate hold — the user has to hold for RESUME_SKIP_HOLD_S to
+        # actually dismiss the prompt, otherwise the release clears it.
+        if STATE.awaiting_resume:
+            _ptt_resume_skip_mode = True
+            display.show_ptt_footer(
+                {"type": "resume_block",
+                 "page": STATE.resume_target_page,
+                 "title": STATE.oled_title or STATE.book_title},
+                f"hold to skip ({RESUME_SKIP_HOLD_S:.0f}s)",
+            )
             return
 
-        display.show_status("Lumos", ["thinking..."])
+        # Scenario 2: device is busy doing other work; short "busy" hint.
+        if STATE.busy:
+            display.show_ptt_footer(
+                _ptt_body_context(),
+                "busy\u2026 one moment",
+            )
+            return
+
+        # Scenario 3: real PTT. Start recording + footer ticker.
         try:
-            question = ai.transcribe_audio(wav)
+            _ptt_rec = audio.PTTRecorder(out_path=QUESTION_WAV)
+            _ptt_rec.start()
+        except audio.AudioError as e:
+            log.warning("PTT start failed: %r", e)
+            _ptt_rec = None
+            display.show_ptt_footer(
+                _ptt_body_context(),
+                "mic error",
+            )
+            return
+        with STATE.lock:
+            STATE.busy = True
+        STATE.touch()
+        _ptt_footer_stop = threading.Event()
+        threading.Thread(
+            target=_ptt_footer_ticker,
+            daemon=True,
+            name="ptt-footer",
+        ).start()
+
+
+def _on_button_up() -> None:
+    """Button was released. Close out whichever scenario _on_button_down
+    set up, and dispatch transcribe/answer on a worker thread if we have
+    a real PTT recording."""
+    global _ptt_rec, _ptt_resume_skip_mode, _ptt_footer_stop
+    with _ptt_lock:
+        held_for = time.monotonic() - (_ptt_press_at or time.monotonic())
+        skip_mode = _ptt_resume_skip_mode
+        rec = _ptt_rec
+
+        # Stop the footer ticker immediately so it doesn't race the
+        # transcribing/thinking overlays below.
+        if _ptt_footer_stop is not None:
+            _ptt_footer_stop.set()
+            _ptt_footer_stop = None
+
+        if skip_mode:
+            _ptt_resume_skip_mode = False
+            if held_for >= RESUME_SKIP_HOLD_S:
+                log.info("resume skipped via long-press (%.1fs)", held_for)
+                with STATE.lock:
+                    STATE.awaiting_resume = False
+                display.show_status(
+                    "Lumos",
+                    ["resume skipped", "reading from", "this page"],
+                )
+            else:
+                log.info(
+                    "short press during resume (%.1fs < %.1fs)",
+                    held_for, RESUME_SKIP_HOLD_S,
+                )
+                target = STATE.resume_target_page
+                # Brief hint so the reader understands why their tap didn't
+                # open the question flow. Idle loop's STATIC_REFRESH_S will
+                # put the resume prompt back up automatically.
+                display.show_status(
+                    "Lumos",
+                    [f"turn to p. {target}", "first, then ask"],
+                )
+            return
+
+        if rec is None:
+            # Busy or error path; nothing to stop.
+            return
+
+        # Real PTT release.
+        _ptt_rec = None
+    # Leave the lock before doing heavy work.
+
+    try:
+        wav = rec.stop()
+    except audio.AudioError as e:
+        log.warning("PTT stop failed: %r", e)
+        with STATE.lock:
+            STATE.busy = False
+        display.show_status("Lumos", ["mic error", "try again"])
+        return
+
+    if rec.elapsed() < PTT_MIN_SECONDS:
+        log.info("PTT too short (%.2fs), discarding", rec.elapsed())
+        with STATE.lock:
+            STATE.busy = False
+        display.show_status("Lumos", ["press &", "hold to talk"])
+        return
+
+    threading.Thread(
+        target=_handle_ptt_answer,
+        args=(wav,),
+        daemon=True,
+        name="ptt-answer",
+    ).start()
+
+
+def _handle_ptt_answer(wav_path: Path) -> None:
+    """Transcribe the PTT wav, call Gemini for an answer, persist, render."""
+    try:
+        display.show_status("Lumos", ["transcribing\u2026"])
+        try:
+            question = ai.transcribe_audio(wav_path)
         except ai.AIError as e:
             log.warning("transcribe failed: %r", e)
             display.show_status("Lumos", ["no signal,", "couldn't hear"])
             return
-
         if not question:
             display.show_status("Lumos", ["didn't catch", "that, again?"])
             return
+        log.info("ptt question: %r", question)
 
-        log.info("question: %r", question)
-
+        display.show_status("Lumos", ["thinking\u2026"])
         try:
             path = camera.capture(FRAME_PATH)
         except camera.CameraError:
             path = None
-        summaries = db.recent_summaries(STATE.book_id, 5) if STATE.book_id else []
+        summaries = (
+            db.recent_summaries(STATE.book_id, 5) if STATE.book_id else []
+        )
         try:
             result = ai.answer_question(
-                path, question, STATE.book_title, STATE.current_page, summaries
+                path,
+                question,
+                STATE.book_title,
+                STATE.current_page,
+                summaries,
             )
         except ai.AIError as e:
             log.warning("answer failed: %r", e)
@@ -579,10 +869,6 @@ def handle_question() -> None:
         STATE.touch()
 
 
-def _on_button() -> None:
-    threading.Thread(target=handle_question, daemon=True, name="button-handler").start()
-
-
 def install_button() -> None:
     try:
         from gpiozero import Button
@@ -591,10 +877,11 @@ def install_button() -> None:
         return
     try:
         btn = Button(BUTTON_PIN, pull_up=True, bounce_time=0.05)
-        btn.when_pressed = _on_button
-        # Keep a module-level reference so it isn't GC'd
+        btn.when_pressed = _on_button_down
+        btn.when_released = _on_button_up
+        # Keep a module-level reference so it isn't GC'd.
         globals()["_BUTTON"] = btn
-        log.info("button installed on GPIO %d", BUTTON_PIN)
+        log.info("hold-to-talk button installed on GPIO %d", BUTTON_PIN)
     except Exception as e:
         log.warning("button init failed: %r — button disabled", e)
 
@@ -628,6 +915,22 @@ def main() -> None:
         sys.exit(2)
 
     db.init_db()
+
+    # Clean-demo reset: when LUMOS_FRESH_START=1 is set in the environment
+    # (or ~/.lumos.env), wipe all books/pages/questions on boot so the
+    # on-device experience starts from zero. Useful for demos where the
+    # current DB might still hold yesterday's test data.
+    if os.environ.get("LUMOS_FRESH_START", "").strip() in ("1", "true", "yes"):
+        try:
+            result = db.reset()
+            log.info(
+                "LUMOS_FRESH_START: wiped db. before=%r after=%r",
+                result.get("before", {}).get("counts"),
+                result.get("after", {}).get("counts"),
+            )
+        except Exception as e:
+            log.warning("LUMOS_FRESH_START reset failed: %r", e)
+
     display.show_status("Lumos", ["booting..."])
 
     signal.signal(signal.SIGINT, _clean_shutdown)

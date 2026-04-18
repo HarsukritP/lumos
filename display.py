@@ -192,6 +192,39 @@ def show_caught_up(page_number: int | None, book_title: str | None = None) -> No
         _flush(img)
 
 
+def show_resume_prompt(book_title: str | None, target_page: int) -> None:
+    """Shown right after identifying a book we've read before. Instructs
+    the reader to flip to their last page so Lumos can re-anchor before
+    it starts summarizing. Layout:
+        [top]    <title (truncated)>
+        [middle] p. 312               <- big, same scale as show_caught_up
+        [footer] turn to this page
+    """
+    img = _blank()
+    draw = ImageDraw.Draw(img)
+
+    if book_title and book_title != "Unknown":
+        title = book_title
+        max_chars = 20
+        if len(title) > max_chars:
+            title = title[: max_chars - 1] + "\u2026"
+        tw = _text_width(draw, title, FONT_SM)
+        draw.text(((OLED_WIDTH - tw) // 2, 0), title, font=FONT_SM, fill=255)
+
+    page_str = f"p. {target_page}" if target_page else "p. ?"
+    tw = _text_width(draw, page_str, FONT_XL)
+    x = max(2, (OLED_WIDTH - tw) // 2)
+    draw.text((x, 12), page_str, font=FONT_XL, fill=255)
+
+    footer = "turn to this page"
+    fw = _text_width(draw, footer, FONT_SM)
+    draw.text(((OLED_WIDTH - fw) // 2, OLED_HEIGHT - FONT_SM.size - 2),
+              footer, font=FONT_SM, fill=255)
+
+    with _lock:
+        _flush(img)
+
+
 def show_page_summary(page_number: int, summary: str) -> None:
     body = wrap(summary, FONT_SM, OLED_WIDTH - 4)
     img = _blank()
@@ -324,6 +357,90 @@ def show_qr(url: str, caption: str | None = None) -> None:
     _centered("SCAN",    2, FONT_LG)
     _centered("to open", 24, FONT_SM)
     _centered("Lumos",  40, FONT_LG)
+
+    with _lock:
+        _flush(img)
+
+
+def show_ptt_footer(body: dict, footer_text: str) -> None:
+    """Overlay a minimal ~12px footer on top of the idle hero content.
+
+    `body` describes what the body (above the footer) should contain:
+      {"type": "caught_up", "page": int, "title": str}   — show the big page #
+      {"type": "card", "card": {...}}                    — vocab/character card
+      {"type": "resume_block", "page": int, "title": str} — during resume press
+      {"type": "blank"}                                   — black body
+
+    The footer is a horizontal 1-px-high divider plus one line of text,
+    right-aligned so the hero content stays visually anchored left.
+    """
+    footer_h = FONT_SM.size + 4   # 10 + 4 = 14 px reserved at the bottom
+    body_box = (0, 0, OLED_WIDTH, OLED_HEIGHT - footer_h)
+
+    img = _blank()
+    draw = ImageDraw.Draw(img)
+
+    btype = body.get("type", "blank") if isinstance(body, dict) else "blank"
+
+    if btype == "caught_up":
+        title = body.get("title") or ""
+        if title and title != "Unknown":
+            if len(title) > 20:
+                title = title[:19] + "\u2026"
+            draw.text((2, 0), title, font=FONT_SM, fill=255)
+        page = body.get("page") or 0
+        page_str = f"p. {page}" if page else "p. ?"
+        tw = _text_width(draw, page_str, FONT_LG)
+        x = max(2, (OLED_WIDTH - tw) // 2)
+        # Body region is ~50px tall; draw the page number centered in it.
+        draw.text((x, (body_box[3] - FONT_LG.size) // 2 - 2),
+                  page_str, font=FONT_LG, fill=255)
+
+    elif btype == "card":
+        card = body.get("card") or {}
+        ctype = card.get("type")
+        if ctype == "vocab":
+            word = (card.get("word") or "").upper()
+            draw.text((2, 0), word[:16], font=FONT_MD, fill=255)
+            defn = card.get("definition") or ""
+            y = 14
+            for line in wrap(defn, FONT_SM, OLED_WIDTH - 4)[:3]:
+                if y + FONT_SM.size > body_box[3]:
+                    break
+                draw.text((2, y), line, font=FONT_SM, fill=255)
+                y += FONT_SM.size + 1
+        elif ctype == "character":
+            draw.text((2, 0), card.get("name", "")[:16], font=FONT_MD, fill=255)
+            blurb = card.get("role") or ""
+            y = 14
+            for line in wrap(blurb, FONT_SM, OLED_WIDTH - 4)[:3]:
+                if y + FONT_SM.size > body_box[3]:
+                    break
+                draw.text((2, y), line, font=FONT_SM, fill=255)
+                y += FONT_SM.size + 1
+
+    elif btype == "resume_block":
+        title = body.get("title") or ""
+        if title and title != "Unknown":
+            if len(title) > 20:
+                title = title[:19] + "\u2026"
+            tw = _text_width(draw, title, FONT_SM)
+            draw.text(((OLED_WIDTH - tw) // 2, 0), title, font=FONT_SM, fill=255)
+        page = body.get("page") or 0
+        page_str = f"p. {page}" if page else "p. ?"
+        tw = _text_width(draw, page_str, FONT_LG)
+        x = max(2, (OLED_WIDTH - tw) // 2)
+        draw.text((x, (body_box[3] - FONT_LG.size) // 2 - 1),
+                  page_str, font=FONT_LG, fill=255)
+
+    # else: blank body.
+
+    # Divider line and footer text.
+    fy = OLED_HEIGHT - footer_h
+    draw.line([(2, fy), (OLED_WIDTH - 3, fy)], fill=255, width=1)
+    fw = _text_width(draw, footer_text, FONT_SM)
+    fx = OLED_WIDTH - fw - 2
+    draw.text((fx, fy + 2), footer_text, font=FONT_SM, fill=255)
 
     with _lock:
         _flush(img)

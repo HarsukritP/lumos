@@ -410,6 +410,146 @@ nav.tabs a svg { width: 22px; height: 22px; }
 }
 .debug-audio audio { width: 100%; }
 
+.debug-value.warn { color: var(--amber); }
+
+/* identify trail */
+.debug-trail,
+.debug-stats,
+.debug-tables,
+.debug-danger {
+  background: var(--surface);
+  border: 1px solid var(--amber-border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.debug-trail h3,
+.debug-stats h3,
+.debug-tables h3,
+.debug-danger h3 {
+  margin: 0 0 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.trail-row {
+  display: grid;
+  grid-template-columns: 44px 1fr auto;
+  grid-template-areas: "conf title age" "conf author age";
+  gap: 2px 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  font-size: 12px;
+  align-items: center;
+}
+.trail-row:last-child { border-bottom: 0; }
+.trail-row .mono { grid-area: conf; font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+.trail-row .mono.ok   { color: var(--success); }
+.trail-row .mono.warn { color: var(--amber); }
+.trail-row .mono.bad  { color: var(--warn); }
+.trail-title { grid-area: title; color: var(--text); }
+.trail-author { grid-area: author; color: var(--muted); }
+.trail-age { grid-area: age; color: var(--muted); }
+
+.small { font-size: 11px; color: var(--muted); }
+.empty.small { padding: 6px 2px; }
+
+/* tables inspector */
+.table-section {
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  padding: 6px 0;
+}
+.table-section:last-child { border-bottom: 0; }
+.table-section summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+.table-section summary::-webkit-details-marker { display: none; }
+.table-section summary .count {
+  background: rgba(255, 176, 58, 0.1);
+  color: var(--amber);
+  border: 1px solid var(--amber-border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.table-scroll {
+  overflow-x: auto;
+  margin-top: 8px;
+  border: 1px solid rgba(255,255,255,0.05);
+  border-radius: 6px;
+}
+.db-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+}
+.db-table th,
+.db-table td {
+  padding: 5px 8px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.db-table th {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 10px;
+  background: rgba(255,255,255,0.02);
+}
+.db-table tbody tr:last-child td { border-bottom: 0; }
+.db-table tbody tr:hover td { background: rgba(255, 176, 58, 0.04); }
+
+/* danger / reset zone */
+.debug-danger {
+  border-color: rgba(220, 80, 80, 0.35);
+}
+.debug-danger h3 { color: #f07070; }
+.debug-danger p { margin: 0 0 10px; }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--amber-border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.btn:hover { background: rgba(255, 176, 58, 0.08); }
+.btn.ghost { color: var(--muted); border-color: rgba(255,255,255,0.1); }
+.btn.danger {
+  color: #f07070;
+  border-color: rgba(220, 80, 80, 0.35);
+}
+.btn.danger:hover { background: rgba(220, 80, 80, 0.08); }
+.btn.danger.solid {
+  background: #c23a3a;
+  color: #fff;
+  border-color: #c23a3a;
+}
+.btn.danger.solid:hover { background: #a82828; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.hidden { display: none !important; }
+
+.debug-result { margin-top: 10px; font-size: 12px; font-family: 'JetBrains Mono', monospace; }
+.debug-result.ok  { color: var(--success); }
+.debug-result.bad { color: var(--warn); }
+
 /* ---- scanline overlay on library hero only (optional polish) ---- */
 .hero.scanlines::after {
   content: '';

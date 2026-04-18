@@ -68,6 +68,19 @@ class State:
         # book-switch tracking
         self.dissimilar_since: float | None = None
 
+        # "Open a chat" resume flow. After identifying a book we've seen
+        # before (current_page > 0 at identify time), we hold in
+        # awaiting_resume until the reader flips to that page (or past it),
+        # long-presses the button to skip, or the RESUME_TIMEOUT_S expires.
+        # While awaiting_resume, the watch loop does NOT call summarize_page
+        # and the OLED shows the resume prompt.
+        self.awaiting_resume: bool = False
+        self.resume_target_page: int = 0
+        self.awaiting_resume_since: float = 0.0
+        # Most recent printed page number OCR'd from a stable frame. None if
+        # the last OCR failed or the frame had no detectable number.
+        self.last_detected_page: int | None = None
+
     def touch(self) -> None:
         self.last_activity = time.time()
 
@@ -92,6 +105,9 @@ class State:
             "started_at": self.started_at,
             "uptime_s": time.time() - self.started_at,
             "last_commit_at": self.last_commit_at,
+            "awaiting_resume": self.awaiting_resume,
+            "resume_target_page": self.resume_target_page,
+            "last_detected_page": self.last_detected_page,
         }
 
     def to_debug(self) -> dict:
@@ -114,6 +130,9 @@ class State:
             "uptime_s": time.time() - self.started_at,
             "identify_trail": trail,
             "dissimilar_since": self.dissimilar_since,
+            "awaiting_resume": self.awaiting_resume,
+            "resume_target_page": self.resume_target_page,
+            "last_detected_page": self.last_detected_page,
         }
 
     def reset_book(self) -> None:
@@ -132,6 +151,10 @@ class State:
             self.current_author_key = None
             self.oled_title = ""
             self.dissimilar_since = None
+            self.awaiting_resume = False
+            self.resume_target_page = 0
+            self.awaiting_resume_since = 0.0
+            self.last_detected_page = None
 
 
 STATE = State()
