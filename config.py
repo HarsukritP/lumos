@@ -91,15 +91,14 @@ QR_EVERY_SECONDS = 60.0
 ANSWER_DISPLAY_S = 8.0
 
 QUESTION_RECORD_SECONDS = 5
-# The INMP441 is a mono I2S mic. plughw:0,0 (with the ALSA plug layer)
-# handles the format conversion from the hardware's native S32_LE/2ch to
-# whatever we request here. 16kHz mono S16_LE is the standard speech
-# format — Gemini transcribes it reliably and file sizes stay small
-# (~32 KB/s vs ~384 KB/s with 48k/2ch/S32).
-ARECORD_DEVICE = "plughw:0,0"
-ARECORD_RATE = 16000
-ARECORD_CHANNELS = 1
-ARECORD_FORMAT = "S16_LE"
+# The INMP441 is a mono I2S mic on the LEFT channel. We record in the
+# hardware's native format (S32_LE stereo 48kHz) then post-process to
+# mono 16kHz 16-bit in audio.py before sending to Gemini. The ALSA
+# plug layer was silently dropping data when asked to convert inline.
+ARECORD_DEVICE = "hw:0,0"
+ARECORD_RATE = 48000
+ARECORD_CHANNELS = 2
+ARECORD_FORMAT = "S32_LE"
 
 MODEL_NAME = "gemini-2.5-flash"
 

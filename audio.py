@@ -6,13 +6,19 @@ Two modes:
     a button, we spin up an arecord subprocess that runs in the background,
     and when the button is released we SIGINT arecord so it closes the WAV
     cleanly. A MAX_SECONDS watchdog terminates runaway recordings.
+
+The INMP441 outputs 24-bit data packed in 32-bit frames on the LEFT I2S
+channel only. We record in native hw format (S32_LE stereo 48kHz) then
+post-process to mono 16kHz 16-bit WAV which Gemini handles well.
 """
 from __future__ import annotations
 
 import logging
 import signal
+import struct
 import subprocess
 import time
+import wave
 from pathlib import Path
 
 from config import (
@@ -32,6 +38,50 @@ class AudioError(RuntimeError):
     pass
 
 
+# ----- S32 stereo → S16 mono conversion ----------------------------------
+
+_TARGET_RATE = 16000
+
+def _convert_s32_stereo_to_s16_mono(src: Path, dst: Path) -> Path:
+    """Extract left channel from an S32_LE stereo 48kHz WAV, shift the
+    24-bit-in-32 samples down to 16-bit, and write a mono 16kHz WAV.
+
+    The INMP441 packs 24-bit audio in the high bits of a 32-bit word.
+    Right-shifting by 16 gives us an effective 16-bit sample."""
+    with wave.open(str(src), "rb") as w:
+        assert w.getnchannels() == 2 and w.getsampwidth() == 4
+        in_rate = w.getframerate()
+        raw = w.readframes(w.getnframes())
+
+    count = len(raw) // 4
+    all_samples = struct.unpack(f"<{count}i", raw)
+    # Pick whichever channel has signal. The INMP441 outputs on LEFT when
+    # L/R=GND, RIGHT when L/R=VDD. Auto-detect so wiring changes just work.
+    left = all_samples[0::2]
+    right = all_samples[1::2]
+    left_nz = sum(1 for x in left if x != 0)
+    right_nz = sum(1 for x in right if x != 0)
+    mono = right if right_nz > left_nz else left
+    s16 = [max(-32768, min(32767, s >> 16)) for s in mono]
+
+    # Downsample from in_rate → 16kHz via simple decimation.
+    # Works cleanly for 48000→16000 (factor 3) and 44100→16000 (nearest).
+    step = max(1, round(in_rate / _TARGET_RATE))
+    decimated = s16[::step]
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(dst), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(_TARGET_RATE)
+        out.writeframes(struct.pack(f"<{len(decimated)}h", *decimated))
+    log.debug(
+        "convert: %s (%d samples) -> %s (%d samples, %d Hz)",
+        src, len(left), dst, len(decimated), _TARGET_RATE,
+    )
+    return dst
+
+
 # ----- fixed-duration recording (legacy + smoke tests) --------------------
 
 def record(
@@ -39,8 +89,9 @@ def record(
     out_path: Path | str = QUESTION_WAV,
     device: str = ARECORD_DEVICE,
 ) -> Path:
-    """Record `seconds` of audio to a WAV file and return the path."""
+    """Record `seconds` of audio, convert to mono 16kHz S16, return path."""
     out = Path(out_path)
+    raw_path = out.with_suffix(".raw.wav")
     out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "arecord",
@@ -49,14 +100,16 @@ def record(
         "-r", str(ARECORD_RATE),
         "-f", ARECORD_FORMAT,
         "-d", str(seconds),
-        str(out),
+        str(raw_path),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=seconds + 5)
-    if proc.returncode != 0 or not out.exists() or out.stat().st_size < 1024:
+    if proc.returncode != 0 or not raw_path.exists() or raw_path.stat().st_size < 1024:
         raise AudioError(
-            f"arecord failed ({proc.returncode}) size={out.stat().st_size if out.exists() else 0}: "
+            f"arecord failed ({proc.returncode}) size={raw_path.stat().st_size if raw_path.exists() else 0}: "
             f"{proc.stderr[-300:]}"
         )
+    _convert_s32_stereo_to_s16_mono(raw_path, out)
+    raw_path.unlink(missing_ok=True)
     return out
 
 
@@ -79,6 +132,7 @@ class PTTRecorder:
         max_seconds: int = PTT_MAX_SECONDS,
     ) -> None:
         self.out_path = Path(out_path)
+        self._raw_path = self.out_path.with_suffix(".raw.wav")
         self.device = device
         self.max_seconds = max_seconds
         self.proc: subprocess.Popen | None = None
@@ -97,7 +151,7 @@ class PTTRecorder:
             "-r", str(ARECORD_RATE),
             "-f", ARECORD_FORMAT,
             "-d", str(self.max_seconds),
-            str(self.out_path),
+            str(self._raw_path),
         ]
         log.info("PTT start: %s", " ".join(cmd))
         try:
@@ -166,26 +220,31 @@ class PTTRecorder:
                 self.proc.returncode, graceful, stderr_tail,
             )
 
-        # Poll briefly for the file — the filesystem write can lag a bit
-        # behind arecord's exit on a busy Pi.
+        # Poll briefly for the raw file — the filesystem write can lag a
+        # bit behind arecord's exit on a busy Pi.
         deadline = time.monotonic() + 1.0
-        while not self.out_path.exists() and time.monotonic() < deadline:
+        while not self._raw_path.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
 
-        if not self.out_path.exists():
+        if not self._raw_path.exists():
             raise AudioError(
-                f"PTT produced no file at {self.out_path} "
+                f"PTT produced no file at {self._raw_path} "
                 f"(arecord exit={self.proc.returncode}; stderr={stderr_tail!r})"
             )
-        size = self.out_path.stat().st_size
-        if size < 2048:  # < ~21ms at 48kHz/2ch/S32 — treat as noise/misfire
+        size = self._raw_path.stat().st_size
+        if size < 2048:
             raise AudioError(
                 f"PTT wav too short ({size} bytes; "
                 f"arecord exit={self.proc.returncode}; stderr={stderr_tail!r})"
             )
+
+        # Convert S32 stereo → S16 mono 16kHz for Gemini.
+        _convert_s32_stereo_to_s16_mono(self._raw_path, self.out_path)
+        self._raw_path.unlink(missing_ok=True)
+        final_size = self.out_path.stat().st_size
         log.info(
-            "PTT stop: %.2fs recorded, %d bytes -> %s",
-            self.elapsed(), size, self.out_path,
+            "PTT stop: %.2fs recorded, %d bytes (raw %d) -> %s",
+            self.elapsed(), final_size, size, self.out_path,
         )
         return self.out_path
 
